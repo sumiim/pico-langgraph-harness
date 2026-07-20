@@ -6,6 +6,7 @@ import pytest
 
 from pico.evaluation.evaluator import (
     BenchmarkEvaluator,
+    _now_in_timezone,
     load_benchmark,
     normalize_evaluation_artifact,
     run_harness_regression_v2,
@@ -13,6 +14,7 @@ from pico.evaluation.evaluator import (
     summarize_rows,
     validate_benchmark,
 )
+from zoneinfo import ZoneInfoNotFoundError
 
 
 def test_load_benchmark_validates_fixed_schema():
@@ -31,6 +33,17 @@ def test_load_benchmark_validates_fixed_schema():
         assert {"id", "prompt", "fixture_repo", "allowed_tools", "step_budget", "expected_artifact", "verifier", "category"} <= set(task)
         assert isinstance(task["allowed_tools"], list)
         assert task["step_budget"] > 0
+
+
+def test_default_timezone_falls_back_without_external_tzdata(monkeypatch):
+    def missing_timezone(_):
+        raise ZoneInfoNotFoundError("missing tzdata")
+
+    monkeypatch.setattr("pico.evaluation.evaluator.ZoneInfo", missing_timezone)
+
+    captured_at = _now_in_timezone("Asia/Shanghai")
+
+    assert captured_at.endswith("+0800")
 
 
 def test_load_benchmark_rejects_missing_required_task_fields(tmp_path):

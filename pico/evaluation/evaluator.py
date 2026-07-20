@@ -5,9 +5,9 @@ import shutil
 import subprocess
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PureWindowsPath
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..features import memory as memorylib
 from ..providers.clients import FakeModelClient
@@ -171,7 +171,13 @@ def _current_locale():
 
 
 def _now_in_timezone(timezone_name):
-    return datetime.now(ZoneInfo(timezone_name)).strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        timezone_info = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        if timezone_name != DEFAULT_TIMEZONE:
+            raise
+        timezone_info = timezone(timedelta(hours=8), name=DEFAULT_TIMEZONE)
+    return datetime.now(timezone_info).strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
 def _artifact_path_for_task(task):
