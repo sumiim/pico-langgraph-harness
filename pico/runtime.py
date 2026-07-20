@@ -9,6 +9,7 @@ import hashlib
 import os
 import re
 import uuid
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -17,8 +18,10 @@ from .features import memory as memorylib
 from . import security as securitylib
 from .context_manager import ContextManager
 from .checkpoint import CHECKPOINT_NONE_STATUS
+from .event_sink import EventSink, JsonlSink
 from .prompt_prefix import build_prompt_prefix, tool_signature
 from .run_store import RunStore
+from .run_lifecycle import finalize_failed_run
 from .security import REDACTED_VALUE
 from .session_store import SessionStore
 from .tool_context import ToolContext
@@ -69,6 +72,9 @@ class Pico:
         feature_flags=None,
         allowed_tools=None,
         progress_callback=None,
+        event_sink=None,
+        allow_checkpoint=True,
+        allow_durable_memory_write=True,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -87,7 +93,10 @@ class Pico:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.allowed_tools = self._normalize_allowed_tools(allowed_tools)
         self.progress_callback = progress_callback
+        self.allow_checkpoint = bool(allow_checkpoint)
+        self.allow_durable_memory_write = bool(allow_durable_memory_write)
         self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".pico" / "runs")
+        self.event_sink: EventSink = event_sink if event_sink is not None else JsonlSink(self.run_store)
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
             "created_at": now(),
@@ -110,6 +119,8 @@ class Pico:
         self.session_path = self.session_store.save(self.session)
         self.current_task_state = None
         self.current_run_dir = None
+        self.child_task_states = []
+        self.agent_role = "coordinator"
         self.last_prompt_metadata = {}
         self.last_completion_metadata = {}
         self.last_durable_promotions = []
@@ -348,8 +359,7 @@ class Pico:
         payload = self.redact_artifact(payload or {})
         payload["event"] = event
         payload["created_at"] = now()
-        # trace 是运行中的逐事件时间线，适合回答“这一轮 agent 到底做了什么”。
-        self.run_store.append_trace(task_state, payload)
+        self.event_sink.emit(task_state, event, payload)
         return payload
 
     def capture_workspace_snapshot(self):
@@ -498,6 +508,11 @@ class Pico:
         return promotions, rejections
 
     def promote_durable_memory(self, user_message, final_answer):
+        if not self.allow_durable_memory_write:
+            self.last_durable_promotions = []
+            self.last_durable_rejections = []
+            self.last_durable_superseded = []
+            return [], [], []
         promotions, rejections = self.extract_durable_promotions(user_message, final_answer)
         promoted, superseded = self.memory.promote_durable(promotions)
         self.session["memory"] = self.memory.to_dict()
@@ -567,6 +582,9 @@ class Pico:
             "attempts": task_state.attempts,
             "checkpoint_id": task_state.checkpoint_id,
             "resume_status": task_state.resume_status,
+            "sandbox_violations": task_state.sandbox_violations,
+            "malformed_output_recovered": task_state.malformed_output_recovered,
+            "affected_paths": list(task_state.affected_paths),
             "task_state": task_state.to_dict(),
             "prompt_metadata": self.last_prompt_metadata,
             "durable_promotions": list(self.last_durable_promotions),
@@ -594,26 +612,92 @@ class Pico:
 
     def spawn_delegate(self, args):
         task = str(args.get("task", "")).strip()
-        child = Pico(
-            model_client=self.model_client,
-            workspace=self.workspace,
-            session_store=self.session_store,
-            run_store=self.run_store,
-            approval_policy="never",
-            max_steps=int(args.get("max_steps", 3)),
-            max_new_tokens=self.max_new_tokens,
-            depth=self.depth + 1,
-            max_depth=self.max_depth,
-            read_only=True,
-            secret_env_names=self.secret_env_names,
-            shell_env_allowlist=self.shell_env_allowlist,
-            progress_callback=self.progress_callback,
-        )
-        # 委派的目标是“调查”，不是“放权执行”。
-        # 子 agent 以只读方式运行、步数更少，最后只把结论文本返回给父 agent。
-        child.session["memory"]["task"] = task
-        child.session["memory"]["notes"] = [clip(self.history_text(), 300)]
-        return "delegate_result:\n" + child.ask(task)
+        max_steps = int(args.get("max_steps", 3))
+        started_at = time.monotonic()
+        child = None
+        error = None
+        result = ""
+        if self.current_task_state is not None:
+            self.emit_trace(
+                self.current_task_state,
+                "delegate_started",
+                {
+                    "agent_role": "delegate",
+                    "task": clip(task, 200),
+                    "max_steps": max_steps,
+                    "status": "started",
+                },
+            )
+        try:
+            child = Pico(
+                model_client=self.model_client,
+                workspace=self.workspace,
+                session_store=self.session_store,
+                run_store=self.run_store,
+                approval_policy="never",
+                max_steps=max_steps,
+                max_new_tokens=self.max_new_tokens,
+                depth=self.depth + 1,
+                max_depth=self.max_depth,
+                read_only=True,
+                secret_env_names=self.secret_env_names,
+                shell_env_allowlist=self.shell_env_allowlist,
+                progress_callback=self.progress_callback,
+                event_sink=self.event_sink,
+                allow_checkpoint=self.allow_checkpoint,
+                allow_durable_memory_write=self.allow_durable_memory_write,
+            )
+            child.agent_role = "delegate"
+            # 委派的目标是“调查”，不是“放权执行”。
+            # 子 agent 以只读方式运行、步数更少，最后只把结论文本返回给父 agent。
+            child.session["memory"]["task"] = task
+            child.session["memory"]["notes"] = [clip(self.history_text(), 300)]
+            result = child.ask(task)
+        except Exception as exc:
+            error = exc
+        finally:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            if error is not None and child is not None and child.current_task_state is not None:
+                finalize_failed_run(
+                    child,
+                    child.current_task_state,
+                    error_type=type(error).__name__,
+                    duration_ms=duration_ms,
+                    stop_reason=getattr(error, "stop_reason", "runtime_error"),
+                )
+            if child is not None:
+                if child.current_task_state is not None:
+                    self.child_task_states.append(child.current_task_state)
+                self.child_task_states.extend(child.child_task_states)
+            if error is not None and self.current_task_state is not None:
+                self.emit_trace(
+                    self.current_task_state,
+                    "delegate_failed",
+                    {
+                        "agent_role": "delegate",
+                        "task": clip(task, 200),
+                        "status": "failed",
+                        "error_type": type(error).__name__,
+                        "duration_ms": duration_ms,
+                        "child_run_id": getattr(getattr(child, "current_task_state", None), "run_id", ""),
+                    },
+                )
+        if error is not None:
+            raise error
+        if self.current_task_state is not None:
+            self.emit_trace(
+                self.current_task_state,
+                "delegate_finished",
+                {
+                    "agent_role": "delegate",
+                    "task": clip(task, 200),
+                    "status": "completed",
+                    "duration_ms": int((time.monotonic() - started_at) * 1000),
+                    "child_run_id": child.current_task_state.run_id if child.current_task_state is not None else "",
+                    "result_preview": clip(result, 300),
+                },
+            )
+        return "delegate_result:\n" + result
 
     def tool_list_files(self, args):
         return toolkit.tool_list_files(self.tool_context(), args)

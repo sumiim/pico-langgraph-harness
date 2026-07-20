@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from pico import FakeModelClient, Pico, SessionStore, WorkspaceContext
 from pico import cli as pico_cli
+from pico.event_sink import CompositeSink, EventCollector, NullSink
 from pico.task_state import TaskState
 
 
@@ -52,6 +53,45 @@ def test_risky_tool_deny_behavior(tmp_path):
     result = agent.run_tool("run_shell", {"command": "echo hi", "timeout": 20})
 
     assert result == "error: approval denied for run_shell"
+
+
+def test_path_escape_is_counted_and_emitted(tmp_path):
+    collector = EventCollector()
+    agent = build_agent(tmp_path, [], event_sink=CompositeSink(collector, NullSink()))
+    state = TaskState.create(run_id="run_path_escape", task_id="task_path_escape", user_request="Escape")
+    agent.current_task_state = state
+    agent.run_store.start_run(state)
+
+    result = agent.run_tool("read_file", {"path": "../outside.txt"})
+
+    assert "path escapes workspace" in result
+    assert state.sandbox_violations == 1
+    event = next(item for item in collector.snapshot() if item["event"] == "sandbox_violation")
+    assert event["security_event_type"] == "path_escape"
+    assert event["agent_role"] == "coordinator"
+
+
+def test_read_only_block_is_counted_with_delegate_role(tmp_path):
+    collector = EventCollector()
+    agent = build_agent(
+        tmp_path,
+        [],
+        approval_policy="never",
+        read_only=True,
+        event_sink=CompositeSink(collector, NullSink()),
+    )
+    agent.agent_role = "review"
+    state = TaskState.create(run_id="run_read_only", task_id="task_read_only", user_request="Do not write")
+    agent.current_task_state = state
+    agent.run_store.start_run(state)
+
+    result = agent.run_tool("write_file", {"path": "blocked.txt", "content": "no"})
+
+    assert result == "error: approval denied for write_file"
+    assert state.sandbox_violations == 1
+    event = next(item for item in collector.snapshot() if item["event"] == "sandbox_violation")
+    assert event["security_event_type"] == "read_only_block"
+    assert event["agent_role"] == "review"
 
 
 def test_cli_build_agent_wires_secret_env_names_from_parser(tmp_path):

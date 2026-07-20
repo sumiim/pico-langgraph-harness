@@ -258,6 +258,11 @@ def build_arg_parser():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description="Minimal coding agent for DeepSeek, OpenAI-compatible, Anthropic-compatible, or Ollama models.",
     )
+    _add_run_arguments(parser)
+    return parser
+
+
+def _add_run_arguments(parser):
     parser.add_argument("prompt", nargs="*", help="Optional one-shot prompt.")
     parser.add_argument("--cwd", default=".", help="Workspace directory.")
     parser.add_argument("--provider", choices=("ollama", "openai", "anthropic", "deepseek"), default="deepseek", help="Model backend to use.")
@@ -284,7 +289,46 @@ def build_arg_parser():
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
     parser.add_argument("--quiet", action="store_true", help="Hide per-step progress messages.")
+
+
+def _add_eval_subcommand(subparsers):
+    parser = subparsers.add_parser("eval", help="run eval harness against benchmark tasks")
+    parser.add_argument("--tasks", default="benchmarks/coding_tasks.json")
+    parser.add_argument("--out", default=None, help="output JSON (default: benchmarks/results/<ts>-eval.json)")
+    parser.add_argument("--backend", choices=("native", "langgraph"), default="native")
+
+
+def _build_command_parser():
+    parser = argparse.ArgumentParser(description="Pico coding agent and evaluation harness.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    run_parser = subparsers.add_parser("run", help="run the native Pico agent")
+    _add_run_arguments(run_parser)
+    _add_eval_subcommand(subparsers)
     return parser
+
+
+def _run_eval(args):
+    from datetime import datetime
+    from pathlib import Path
+
+    from .evaluation.evaluator import run_fixed_benchmark
+
+    output_path = args.out or f"benchmarks/results/{datetime.now().strftime('%Y%m%d-%H%M%S')}-eval.json"
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    result = run_fixed_benchmark(
+        benchmark_path=args.tasks,
+        artifact_path=output_path,
+        backend=args.backend,
+    )
+    summary = result["summary"]
+    print(
+        f"tasks:{summary['total_tasks']}  passed:{summary['passed']}  "
+        f"failed:{summary['failed']}  ({summary['pass_rate']:.0%})"
+    )
+    print(f"-> {output_path}")
+    if summary["eligible_tasks"] == 0:
+        return 2
+    return 0 if summary["failed"] == 0 else 1
 
 
 def print_progress(message):
@@ -292,7 +336,13 @@ def print_progress(message):
 
 
 def main(argv=None):
-    args = build_arg_parser().parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in {"run", "eval"}:
+        args = _build_command_parser().parse_args(argv)
+        if args.command == "eval":
+            return _run_eval(args)
+    else:
+        args = build_arg_parser().parse_args(argv)
     agent = build_agent(args)
 
     model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_OLLAMA_MODEL))

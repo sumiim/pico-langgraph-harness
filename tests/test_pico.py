@@ -158,6 +158,7 @@ def test_agent_retries_after_malformed_tool_payload(tmp_path):
     assert any(item["role"] == "tool" and item["name"] == "read_file" for item in agent.session["history"])
     notices = [item["content"] for item in agent.session["history"] if item["role"] == "assistant"]
     assert any("valid <tool> call" in item for item in notices)
+    assert agent.current_task_state.malformed_output_recovered == 1
 
 
 def test_agent_accepts_xml_write_file_tool(tmp_path):
@@ -173,6 +174,29 @@ def test_agent_accepts_xml_write_file_tool(tmp_path):
 
     assert answer == "Done."
     assert (tmp_path / "hello.py").read_text(encoding="utf-8") == 'print("hi")\n'
+    assert agent.current_task_state.affected_paths == ["hello.py"]
+
+
+def test_checkpoint_and_durable_memory_writes_can_be_disabled(tmp_path):
+    agent = build_agent(
+        tmp_path,
+        ["<final>Decision: Keep this only in the isolated child.</final>"],
+        allow_checkpoint=False,
+        allow_durable_memory_write=False,
+    )
+
+    answer = agent.ask("Remember this decision.")
+
+    assert answer == "Decision: Keep this only in the isolated child."
+    assert agent.current_task_state.checkpoint_id == ""
+    assert agent.session["checkpoints"]["items"] == {}
+    assert agent.last_durable_promotions == []
+    assert not (tmp_path / ".pico" / "memory").exists()
+    trace = [
+        json.loads(line)
+        for line in agent.run_store.trace_path(agent.current_task_state).read_text(encoding="utf-8").splitlines()
+    ]
+    assert not any(event["event"] == "checkpoint_created" for event in trace)
 
 
 def test_retries_do_not_consume_the_whole_budget(tmp_path):

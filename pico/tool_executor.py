@@ -48,14 +48,33 @@ class ToolExecutor:
     def __init__(self, agent: Pico):
         self.agent = agent
 
+    def _record_sandbox_violation(self, tool_error_code, security_event_type, tool_name):
+        agent = self.agent
+        if agent.current_task_state is None:
+            return
+        agent.current_task_state.record_sandbox_violation()
+        agent.run_store.write_task_state(agent.current_task_state)
+        agent.emit_trace(
+            agent.current_task_state,
+            "sandbox_violation",
+            {
+                "tool": tool_name,
+                "tool_error_code": tool_error_code,
+                "security_event_type": security_event_type,
+                "agent_role": getattr(agent, "agent_role", "coordinator"),
+            },
+        )
+
     def execute(self, name, args):
         agent = self.agent
         if agent.allowed_tools is not None and name not in agent.allowed_tools:
+            self._record_sandbox_violation("tool_not_allowed", "tool_not_allowed", name)
             return ToolExecutionResult(
                 content=f"error: tool '{name}' is not allowed in this run",
                 metadata=_metadata(
                     "rejected",
                     tool_error_code="tool_not_allowed",
+                    security_event_type="tool_not_allowed",
                     risk_level="high",
                     read_only=False,
                 ),
@@ -81,6 +100,8 @@ class ToolExecutor:
             if example:
                 message += f"\nexample: {example}"
             security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
+            if security_event_type:
+                self._record_sandbox_violation("invalid_arguments", security_event_type, name)
             return ToolExecutionResult(
                 content=message,
                 metadata=_metadata(
@@ -104,12 +125,15 @@ class ToolExecutor:
             )
 
         if tool["risky"] and not agent.approve(name, args):
+            security_event_type = "read_only_block" if agent.read_only else "approval_denied"
+            if security_event_type == "read_only_block":
+                self._record_sandbox_violation("approval_denied", security_event_type, name)
             return ToolExecutionResult(
                 content=f"error: approval denied for {name}",
                 metadata=_metadata(
                     "rejected",
                     tool_error_code="approval_denied",
-                    security_event_type="read_only_block" if agent.read_only else "approval_denied",
+                    security_event_type=security_event_type,
                     risk_level="high",
                     read_only=False,
                 ),
@@ -151,6 +175,8 @@ class ToolExecutor:
             affected_paths, diff_summary = agent.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
             security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
+            if security_event_type:
+                self._record_sandbox_violation("tool_failed", security_event_type, name)
             metadata = _metadata(
                 "partial_success" if workspace_changed else "error",
                 tool_error_code="tool_partial_success" if workspace_changed else "tool_failed",

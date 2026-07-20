@@ -1,13 +1,61 @@
+import json
 import os
 from unittest.mock import patch
 
 from pico.evaluation.metrics import (
     _provider_profile,
+    aggregate_benchmark_artifact,
     run_context_ablation_v2,
     run_memory_ablation_v2,
     run_recovery_ablation_v2,
     write_benchmark_core_report,
 )
+
+
+def test_aggregate_benchmark_artifact_excludes_skipped_rows(tmp_path):
+    artifact_path = tmp_path / "eval.json"
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "backend": "langgraph",
+                "summary": {
+                    "total_tasks": 2,
+                    "eligible_tasks": 1,
+                    "skipped_tasks": 1,
+                    "passed": 1,
+                    "failed": 0,
+                    "pass_rate": 1.0,
+                    "within_budget": 1,
+                    "verifier_passes": 1,
+                    "failure_category_counts": {},
+                },
+                "rows": [
+                    {
+                        "id": "ran",
+                        "status": "pass",
+                        "tool_steps": 4,
+                        "attempts": 6,
+                        "duration_ms": 20,
+                        "delegate_calls": 2,
+                        "sandbox_violations": 1,
+                    },
+                    {"id": "skip", "status": "skipped", "tool_steps": 0, "attempts": 0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    metrics = aggregate_benchmark_artifact(artifact_path)
+
+    assert metrics["backend"] == "langgraph"
+    assert metrics["eligible_tasks"] == 1
+    assert metrics["skipped_tasks"] == 1
+    assert metrics["avg_tool_steps"] == 4
+    assert metrics["delegate_calls"] == 2
+    assert metrics["sandbox_violations"] == 1
+    assert [row["id"] for row in metrics["rows"]] == ["ran"]
 
 
 def test_run_context_ablation_v2_writes_expected_artifact(tmp_path):

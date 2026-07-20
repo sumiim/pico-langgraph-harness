@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ..config import load_project_env, provider_env
-from .evaluator import run_fixed_benchmark
+from .evaluator import load_evaluation_artifact, run_fixed_benchmark
 from ..providers.clients import AnthropicCompatibleModelClient, FakeModelClient, OpenAICompatibleModelClient
 from ..runtime import Pico, SessionStore
 from ..workspace import WorkspaceContext
@@ -41,20 +41,25 @@ def _parse_iso8601(value):
 
 
 def aggregate_benchmark_artifact(path):
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    payload = load_evaluation_artifact(path)
     rows = list(payload.get("rows", []))
+    eligible_rows = [row for row in rows if row.get("status") != "skipped"]
     summary = dict(payload.get("summary", {}))
     task_count = int(summary.get("total_tasks", len(rows) or 0))
-    tool_steps = [int(row.get("tool_steps", 0)) for row in rows]
-    attempts = [int(row.get("attempts", 0)) for row in rows]
+    tool_steps = [int(row.get("tool_steps", 0)) for row in eligible_rows]
+    attempts = [int(row.get("attempts", 0)) for row in eligible_rows]
+    durations = [int(row.get("duration_ms", 0)) for row in eligible_rows]
     categories = {}
-    for row in rows:
+    for row in eligible_rows:
         category = str(row.get("category", "")).strip()
         if not category:
             continue
         categories[category] = categories.get(category, 0) + 1
     return {
         "task_count": task_count,
+        "eligible_tasks": int(summary.get("eligible_tasks", len(eligible_rows))),
+        "skipped_tasks": int(summary.get("skipped_tasks", task_count - len(eligible_rows))),
+        "backend": payload.get("backend", "native"),
         "passed": int(summary.get("passed", 0)),
         "failed": int(summary.get("failed", 0)),
         "pass_rate": float(summary.get("pass_rate", 0.0)),
@@ -63,8 +68,18 @@ def aggregate_benchmark_artifact(path):
         "failure_category_counts": dict(summary.get("failure_category_counts", {})),
         "avg_tool_steps": _safe_mean(tool_steps),
         "avg_attempts": _safe_mean(attempts),
+        "avg_duration_ms": _safe_mean(durations),
+        "delegate_calls": sum(int(row.get("delegate_calls", 0)) for row in eligible_rows),
+        "delegate_failures": sum(int(row.get("delegate_failures", 0)) for row in eligible_rows),
+        "research_calls": sum(int(row.get("research_calls", 0)) for row in eligible_rows),
+        "review_calls": sum(int(row.get("review_calls", 0)) for row in eligible_rows),
+        "review_retries": sum(int(row.get("review_retries", 0)) for row in eligible_rows),
+        "sandbox_violations": sum(int(row.get("sandbox_violations", 0)) for row in eligible_rows),
+        "malformed_output_recovered": sum(
+            int(row.get("malformed_output_recovered", 0)) for row in eligible_rows
+        ),
         "category_counts": categories,
-        "rows": rows,
+        "rows": eligible_rows,
     }
 
 
