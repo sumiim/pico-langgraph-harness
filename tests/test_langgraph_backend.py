@@ -169,3 +169,40 @@ def test_langgraph_graph_state_contains_only_declared_data_fields():
 
     assert "agent" not in AgentState.__annotations__
     assert "model_client" not in AgentState.__annotations__
+
+
+def test_run_agent_reuses_cli_runtime_and_records_parent_session(tmp_path):
+    from langgraph_pico import run_agent
+    from pico import Pico
+
+    task = load_benchmark("benchmarks/delegate_tasks.json")["tasks"][0]
+    source = Path(task["fixture_repo"])
+    fixture_root = tmp_path / source.name
+    shutil.copytree(source, fixture_root)
+    model_client = FakeModelClient(_scripted_outputs_for_task(task, "langgraph"))
+    event_sink = NullSink()
+    agent = Pico(
+        model_client=model_client,
+        workspace=WorkspaceContext.build(fixture_root, repo_root_override=fixture_root),
+        session_store=SessionStore(fixture_root / ".pico" / "sessions"),
+        run_store=RunStore(fixture_root / ".pico" / "runs"),
+        approval_policy="auto",
+        max_steps=5,
+        event_sink=event_sink,
+    )
+
+    result = run_agent(
+        agent,
+        task["prompt"],
+        acceptance=task["acceptance"],
+        step_budget=task["step_budget"],
+        requires_research=True,
+        focus_paths=[task["artifact_path"]],
+    )
+
+    assert result.task_state.stop_reason == "final_answer_returned"
+    assert [item["role"] for item in agent.session["history"]] == ["user", "assistant"]
+    assert agent.model_client is model_client
+    assert agent.event_sink is event_sink
+    assert any(event.get("event") == "review_passed" for event in result.events)
+    assert "delegated research" in (fixture_root / "README.md").read_text(encoding="utf-8")

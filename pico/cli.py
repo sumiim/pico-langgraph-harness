@@ -265,6 +265,12 @@ def build_arg_parser():
 def _add_run_arguments(parser):
     parser.add_argument("prompt", nargs="*", help="Optional one-shot prompt.")
     parser.add_argument("--cwd", default=".", help="Workspace directory.")
+    parser.add_argument(
+        "--backend",
+        choices=("native", "langgraph"),
+        default="native",
+        help="Agent orchestration backend.",
+    )
     parser.add_argument("--provider", choices=("ollama", "openai", "anthropic", "deepseek"), default="deepseek", help="Model backend to use.")
     parser.add_argument(
         "--model",
@@ -288,6 +294,25 @@ def _add_run_arguments(parser):
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
+    parser.add_argument(
+        "--acceptance",
+        default=None,
+        help="Acceptance criteria for the LangGraph review role. Defaults to the prompt.",
+    )
+    parser.add_argument(
+        "--focus-path",
+        dest="focus_paths",
+        action="append",
+        default=[],
+        help="Workspace-relative review path for LangGraph; may be repeated.",
+    )
+    parser.add_argument(
+        "--research",
+        dest="requires_research",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable the LangGraph research delegate.",
+    )
     parser.add_argument("--quiet", action="store_true", help="Hide per-step progress messages.")
 
 
@@ -301,7 +326,7 @@ def _add_eval_subcommand(subparsers):
 def _build_command_parser():
     parser = argparse.ArgumentParser(description="Pico coding agent and evaluation harness.")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    run_parser = subparsers.add_parser("run", help="run the native Pico agent")
+    run_parser = subparsers.add_parser("run", help="run the Pico agent")
     _add_run_arguments(run_parser)
     _add_eval_subcommand(subparsers)
     return parser
@@ -331,6 +356,29 @@ def _run_eval(args):
     return 0 if summary["failed"] == 0 else 1
 
 
+def _run_request(agent, prompt, args):
+    if getattr(args, "backend", "native") == "native":
+        answer = agent.ask(prompt)
+        return answer, True, agent.current_task_state.stop_reason
+    try:
+        from langgraph_pico import run_agent
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "langgraph backend is optional; install examples/langgraph-pico first"
+        ) from exc
+    result = run_agent(
+        agent,
+        prompt,
+        acceptance=getattr(args, "acceptance", None),
+        step_budget=args.max_steps,
+        requires_research=getattr(args, "requires_research", True),
+        focus_paths=getattr(args, "focus_paths", ()),
+        record_session=True,
+    )
+    succeeded = result.task_state.status == "completed"
+    return result.final_answer, succeeded, result.task_state.stop_reason
+
+
 def print_progress(message):
     print(f"[pico] {message}", file=sys.stderr, flush=True)
 
@@ -355,7 +403,11 @@ def main(argv=None):
         if prompt:
             print()
             try:
-                print(agent.ask(prompt))
+                answer, succeeded, stop_reason = _run_request(agent, prompt, args)
+                print(answer)
+                if not succeeded:
+                    print(f"[pico] stopped: {stop_reason}", file=sys.stderr)
+                    return 1
             except RuntimeError as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
@@ -390,6 +442,9 @@ def main(argv=None):
 
         print()
         try:
-            print(agent.ask(user_input))
+            answer, succeeded, stop_reason = _run_request(agent, user_input, args)
+            print(answer)
+            if not succeeded:
+                print(f"[pico] stopped: {stop_reason}", file=sys.stderr)
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
