@@ -48,6 +48,13 @@ docs/*
 !docs/architecture/
 !docs/architecture/agent-harness-v1-overview.md
 
+# Local planning, notes, and tool settings
+/.claude/
+/规划.md
+/原版项目笔记.md
+/原版项目笔记.backup.md
+/原版项目笔记.pdf
+
 # OS files
 .DS_Store
 
