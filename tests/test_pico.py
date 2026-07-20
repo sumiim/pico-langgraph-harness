@@ -940,13 +940,20 @@ def test_successful_run_persists_run_artifacts_and_stop_reason(tmp_path):
     assert "tool_executed" in trace_events
 
 
-def test_trace_and_report_redact_secret_env_values(tmp_path):
+def test_trace_and_report_redact_secret_env_values(tmp_path, python_shell_command):
     secret = "sk-test-secret-123"
-    with patch.dict(os.environ, {"OPENAI_API_KEY": secret}, clear=True):
+    command = python_shell_command(f"print({secret!r})")
+    tool_call = json.dumps(
+        {
+            "name": "run_shell",
+            "args": {"command": command, "timeout": 20},
+        }
+    )
+    with patch.dict(os.environ, {"OPENAI_API_KEY": secret}, clear=False):
         agent = build_agent(
             tmp_path,
             [
-                '<tool>{"name":"run_shell","args":{"command":"printf \'%s\' \'sk-test-secret-123\'","timeout":20}}</tool>',
+                f"<tool>{tool_call}</tool>",
                 "<final>Masked.</final>",
             ],
         )
