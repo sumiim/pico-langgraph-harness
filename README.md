@@ -27,29 +27,26 @@ flowchart TD
     Backend -->|native| Native["Pico AgentLoop"]
     Backend -->|langgraph| Router["Intent Router"]
 
-    Router -->|conversation| Conversation["Direct model answer"]
-    Router -->|read_only| ReadOnly["Read-only answer executor"]
-    Router -->|code_change| Execute["Code-change executor"]
+    Router --> ResearchGate{"Research?"}
+    ResearchGate -->|yes: read_only / code_change| Research["Research delegate"]
+    ResearchGate -->|no| Intent{"Resolved intent"}
+    Research --> Intent
 
-    Router -. optional .-> Research["Research delegate"]
-    Research --> ReadOnly
-    Research --> Execute
+    Intent -->|conversation| Conversation["Direct model answer"]
+    Intent -->|read_only| ReadOnly["Read-only answer executor"]
+    Intent -->|code_change| Execute["Code-change executor"]
 
     Execute --> Review["Review delegate"]
     Review -->|needs_fix| Execute
-    Review -->|pass| Finalize["Finalize"]
+    Review -->|pass| Finalize["Finalize run"]
     Conversation --> Finalize
     ReadOnly --> Finalize
+    Native --> Finalize
 
-    Native --> Audit["TaskState / EventSink / trace / report"]
-    Router --> Audit
-    Research --> Audit
-    Conversation --> Audit
-    ReadOnly --> Audit
-    Execute --> Audit
-    Review --> Audit
-    Finalize --> Audit
+    Finalize --> Audit["TaskState / EventSink / trace / report"]
 ```
+
+图中的菱形只表示代码控制的选择，不是新增 Agent。Router 会同时解析意图和是否需要调研；Research 只可能出现在 `read_only` 或 `code_change` 执行前。所有分支最终统一进入 `Finalize run`，再落盘 TaskState、trace 和 report；各节点产生的事件仍会在执行过程中通过 EventSink 旁路收集，只是不再画出每条审计连线。
 
 这里的“审计”和 Patch Review 是两件事：所有已经启动的 native / LangGraph 运行都会写入 TaskState，并通过 EventSink 记录事件，最终生成 trace 和 report；只有解析为 `code_change` 的任务必须进入 Review delegate 做修改验收。`conversation` 会记录路由、模型协议、回答和终态事件，`read_only` 还会记录只读工具、可选 Research delegate 与权限边界事件，但二者都不执行 Patch Review。
 
