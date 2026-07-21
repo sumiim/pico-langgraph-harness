@@ -1,6 +1,7 @@
 import hashlib
 import json
 import locale as locale_module
+import re
 import shutil
 import subprocess
 import tempfile
@@ -30,6 +31,15 @@ DEFAULT_TEMPERATURE = 0.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_MAX_NEW_TOKENS = 64
 DEFAULT_TIMEZONE = "Asia/Shanghai"
+TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+WINDOWS_RESERVED_TASK_IDS = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
 
 REQUIRED_BENCHMARK_KEYS = ("schema_version", "tasks")
 REQUIRED_TASK_KEYS = (
@@ -202,7 +212,9 @@ def _scripted_outputs_for_task(task, backend="native"):
 
 
 def _normalized_relative_path(value, fixture_repo, task_id, field):
-    raw = str(value).strip()
+    if not isinstance(value, str):
+        raise ValueError(f"benchmark task {task_id} {field} must be a string")
+    raw = value.strip()
     if not raw:
         raise ValueError(f"benchmark task {task_id} {field} must not be empty")
     candidate = Path(raw)
@@ -217,6 +229,61 @@ def _normalized_relative_path(value, fixture_repo, task_id, field):
     if not relative.parts:
         raise ValueError(f"benchmark task {task_id} {field} must name a path")
     return relative.as_posix()
+
+
+def _normalized_task_id(value):
+    if not isinstance(value, str):
+        raise ValueError("benchmark task id must be a string")
+    task_id = value.strip()
+    windows_stem = task_id.split(".", 1)[0].upper()
+    if (
+        not TASK_ID_PATTERN.fullmatch(task_id)
+        or task_id.endswith(".")
+        or windows_stem in WINDOWS_RESERVED_TASK_IDS
+    ):
+        raise ValueError(
+            "benchmark task id must be a filesystem-safe slug using letters, numbers, '.', '_' or '-'"
+        )
+    return task_id
+
+
+def _normalized_fixture_repo(value, repo_root, task_id):
+    if not isinstance(value, str):
+        raise ValueError(f"benchmark task {task_id} fixture_repo must be a string")
+    raw = value.strip()
+    if not raw:
+        raise ValueError(f"benchmark task {task_id} fixture_repo must not be empty")
+    candidate = Path(raw)
+    if candidate.is_absolute() or PureWindowsPath(raw).is_absolute():
+        raise ValueError(f"benchmark task {task_id} fixture_repo must be relative")
+    resolved = (repo_root / candidate).resolve()
+    try:
+        relative = resolved.relative_to(repo_root)
+    except ValueError as exc:
+        raise ValueError(f"benchmark task {task_id} fixture_repo escapes repository root") from exc
+    if not resolved.is_dir():
+        raise ValueError(f"benchmark task {task_id} fixture repo does not exist: {raw}")
+    if not relative.parts:
+        raise ValueError(f"benchmark task {task_id} fixture_repo must name a repository subdirectory")
+    return relative.as_posix(), resolved
+
+
+def _normalized_setup(value, fixture_repo, task_id):
+    if not isinstance(value, dict):
+        raise ValueError(f"benchmark task {task_id} setup must be a mapping")
+    setup = dict(value)
+    setup_kind = str(setup.get("kind", "")).strip()
+    if setup_kind not in {"context_reduction", "freshness_mismatch", "workspace_mismatch"}:
+        raise ValueError(f"benchmark task {task_id} has an unknown setup kind: {setup_kind}")
+    setup["kind"] = setup_kind
+    if setup_kind == "freshness_mismatch":
+        setup["path"] = _normalized_relative_path(
+            setup.get("path", "sample.txt"),
+            fixture_repo,
+            task_id,
+            "setup.path",
+        )
+    return setup
 
 
 def _fixture_snapshot_id(fixture_paths):
@@ -260,16 +327,24 @@ def validate_benchmark(data, repo_root=None):
                 f"benchmark task {task.get('id', index)!r} is missing required keys: {', '.join(missing_task_keys)}"
             )
 
-        task_id = str(task["id"]).strip()
-        if not task_id:
-            raise ValueError(f"benchmark task at index {index} has an empty id")
-        if task_id in seen_ids:
+        task_id = _normalized_task_id(task["id"])
+        task_id_key = task_id.casefold()
+        if task_id_key in seen_ids:
             raise ValueError(f"duplicate benchmark task id: {task_id}")
-        seen_ids.add(task_id)
+        seen_ids.add(task_id_key)
 
-        fixture_repo = repo_root / str(task["fixture_repo"])
-        if not fixture_repo.is_dir():
-            raise ValueError(f"benchmark task {task_id} fixture repo does not exist: {task['fixture_repo']}")
+        fixture_repo_value, fixture_repo = _normalized_fixture_repo(
+            task["fixture_repo"],
+            repo_root,
+            task_id,
+        )
+
+        normalized_text = {}
+        for field in ("prompt", "expected_artifact", "category"):
+            value = task[field]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"benchmark task {task_id} {field} must be a non-empty string")
+            normalized_text[field] = value.strip()
 
         has_verifier = "verifier" in task
         has_verifier_argv = "verifier_argv" in task
@@ -277,14 +352,18 @@ def validate_benchmark(data, repo_root=None):
             raise ValueError(
                 f"benchmark task {task_id} must provide exactly one of verifier or verifier_argv"
             )
-        if has_verifier and not str(task["verifier"]).strip():
-            raise ValueError(f"benchmark task {task_id} verifier must not be empty")
+        if has_verifier and (
+            not isinstance(task["verifier"], str) or not task["verifier"].strip()
+        ):
+            raise ValueError(f"benchmark task {task_id} verifier must be a non-empty string")
         if has_verifier_argv:
             verifier_argv = task["verifier_argv"]
             if not isinstance(verifier_argv, list) or not verifier_argv:
                 raise ValueError(f"benchmark task {task_id} verifier_argv must be a non-empty list")
-            if any(not str(item) for item in verifier_argv):
-                raise ValueError(f"benchmark task {task_id} verifier_argv contains an empty entry")
+            if any(not isinstance(item, str) or not item for item in verifier_argv):
+                raise ValueError(
+                    f"benchmark task {task_id} verifier_argv must contain non-empty strings"
+                )
 
         allowed_tools = task["allowed_tools"]
         if not isinstance(allowed_tools, list) or not allowed_tools:
@@ -299,7 +378,10 @@ def validate_benchmark(data, repo_root=None):
                 raise ValueError(f"benchmark task {task_id} has an unknown allowed_tools entry: {tool_name}")
             normalized_allowed_tools.append(tool_name)
 
-        step_budget = int(task["step_budget"])
+        raw_step_budget = task["step_budget"]
+        if isinstance(raw_step_budget, bool) or not isinstance(raw_step_budget, int):
+            raise ValueError(f"benchmark task {task_id} step_budget must be an integer")
+        step_budget = raw_step_budget
         if step_budget < 1:
             raise ValueError(f"benchmark task {task_id} step_budget must be positive")
 
@@ -333,16 +415,25 @@ def validate_benchmark(data, repo_root=None):
 
         normalized_task = dict(task)
         normalized_task["id"] = task_id
-        normalized_task["prompt"] = str(task["prompt"]).strip()
-        normalized_task["fixture_repo"] = str(task["fixture_repo"]).strip()
+        normalized_task["prompt"] = normalized_text["prompt"]
+        normalized_task["fixture_repo"] = fixture_repo_value
         normalized_task["allowed_tools"] = normalized_allowed_tools
         normalized_task["step_budget"] = step_budget
-        normalized_task["expected_artifact"] = str(task["expected_artifact"]).strip()
-        normalized_task["category"] = str(task["category"]).strip()
-        normalized_task["acceptance"] = str(task.get("acceptance", normalized_task["prompt"])).strip()
+        normalized_task["expected_artifact"] = normalized_text["expected_artifact"]
+        normalized_task["category"] = normalized_text["category"]
+        acceptance = task.get("acceptance", normalized_task["prompt"])
+        if not isinstance(acceptance, str) or not acceptance.strip():
+            raise ValueError(f"benchmark task {task_id} acceptance must be a non-empty string")
+        normalized_task["acceptance"] = acceptance.strip()
         normalized_task["requires_research"] = requires_research
         normalized_task["focus_paths"] = normalized_focus_paths
         normalized_task["backends"] = normalized_backends
+        if "setup" in task:
+            normalized_task["setup"] = _normalized_setup(
+                task["setup"],
+                fixture_repo,
+                task_id,
+            )
         if has_verifier:
             normalized_task["verifier"] = str(task["verifier"]).strip()
             normalized_task.pop("verifier_argv", None)
@@ -352,7 +443,10 @@ def validate_benchmark(data, repo_root=None):
         if artifact_path is not None:
             normalized_task["artifact_path"] = artifact_path
         if "verifier_timeout_s" in task:
-            normalized_task["verifier_timeout_s"] = int(task["verifier_timeout_s"])
+            verifier_timeout_s = task["verifier_timeout_s"]
+            if isinstance(verifier_timeout_s, bool) or not isinstance(verifier_timeout_s, int):
+                raise ValueError(f"benchmark task {task_id} verifier_timeout_s must be an integer")
+            normalized_task["verifier_timeout_s"] = verifier_timeout_s
         normalized_tasks.append(normalized_task)
 
     normalized = dict(data)
@@ -626,8 +720,25 @@ class BenchmarkEvaluator:
             return self._skipped_row(task)
 
         started_at = time.monotonic()
-        fixture_source = self.repo_root / task["fixture_repo"]
+        task["id"] = _normalized_task_id(task["id"])
+        task["fixture_repo"], fixture_source = _normalized_fixture_repo(
+            task["fixture_repo"],
+            self.repo_root,
+            task["id"],
+        )
+        if "setup" in task:
+            task["setup"] = _normalized_setup(
+                task["setup"],
+                fixture_source,
+                task["id"],
+            )
         fixture_copy_root = self.workspace_root / task["id"] / fixture_source.name
+        try:
+            fixture_copy_root.resolve().relative_to(fixture_source)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("benchmark workspace_root must not be inside fixture_repo")
         if fixture_copy_root.exists():
             shutil.rmtree(fixture_copy_root)
         fixture_copy_root.parent.mkdir(parents=True, exist_ok=True)

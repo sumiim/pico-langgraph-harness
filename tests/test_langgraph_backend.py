@@ -61,6 +61,7 @@ def test_langgraph_research_execute_review_uses_isolated_children_and_memory_eve
     )
 
     assert result.task_state.stop_reason == "final_answer_returned"
+    assert result.task_state.affected_paths == ["README.md"]
     assert result.agent.session["history"] == []
     assert len(result.budget_task_states) == 2
     assert sum(state.tool_steps for state in result.budget_task_states) == 3

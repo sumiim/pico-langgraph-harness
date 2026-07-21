@@ -81,10 +81,25 @@ def test_load_delegate_benchmark_normalizes_extension_fields():
     ("updates", "message"),
     [
         ({"verifier": "python -V"}, "exactly one"),
+        ({"verifier_argv": ["python", 1]}, "must contain non-empty strings"),
+        ({"verifier_timeout_s": True}, "verifier_timeout_s must be an integer"),
+        ({"id": None}, "task id must be a string"),
+        ({"id": "../outside"}, "filesystem-safe slug"),
+        ({"id": "CON"}, "filesystem-safe slug"),
+        ({"fixture_repo": "."}, "must name a repository subdirectory"),
+        ({"fixture_repo": "../outside"}, "escapes repository root"),
+        ({"prompt": ""}, "prompt must be a non-empty string"),
+        ({"step_budget": "2"}, "step_budget must be an integer"),
+        ({"acceptance": ""}, "acceptance must be a non-empty string"),
         ({"requires_research": "true"}, "must be a boolean"),
         ({"backends": ["unknown"]}, "unknown backend"),
         ({"artifact_path": "../outside.txt"}, "escapes fixture root"),
         ({"artifact_path": "C:\\outside.txt"}, "must be relative"),
+        (
+            {"setup": {"kind": "freshness_mismatch", "path": "../outside.txt"}},
+            "setup.path escapes fixture root",
+        ),
+        ({"setup": {"kind": "unknown"}}, "unknown setup kind"),
     ],
 )
 def test_benchmark_extension_validation_rejects_invalid_contracts(tmp_path, updates, message):
@@ -105,6 +120,28 @@ def test_benchmark_extension_validation_rejects_invalid_contracts(tmp_path, upda
 
     with pytest.raises(ValueError, match=message):
         validate_benchmark({"schema_version": 1, "tasks": [task]}, repo_root=tmp_path)
+
+
+def test_benchmark_rejects_case_colliding_task_ids(tmp_path):
+    fixture = tmp_path / "fixture"
+    fixture.mkdir()
+    task = {
+        "id": "CaseTask",
+        "prompt": "Inspect README.",
+        "fixture_repo": "fixture",
+        "allowed_tools": ["read_file"],
+        "step_budget": 2,
+        "expected_artifact": "README exists",
+        "verifier_argv": ["python", "-V"],
+        "category": "contract",
+    }
+    duplicate = {**task, "id": "casetask"}
+
+    with pytest.raises(ValueError, match="duplicate benchmark task id"):
+        validate_benchmark(
+            {"schema_version": 1, "tasks": [task, duplicate]},
+            repo_root=tmp_path,
+        )
 
 
 def test_run_fixed_benchmark_uses_fresh_fixture_copy_and_fresh_run_directory(tmp_path):
@@ -132,6 +169,76 @@ def test_run_fixed_benchmark_uses_fresh_fixture_copy_and_fresh_run_directory(tmp
     assert row["initial_task_summary_empty"] is True
     assert Path("tests/fixtures/bench_repo_patch/sample.txt").read_text(encoding="utf-8") == original_fixture
     assert "beta-locked" in (copied_fixture / "sample.txt").read_text(encoding="utf-8")
+
+
+def test_run_task_revalidates_task_id_before_removing_workspace(tmp_path):
+    evaluator = BenchmarkEvaluator(
+        benchmark_path=Path("benchmarks/coding_tasks.json"),
+        artifact_path=tmp_path / "artifact.json",
+        workspace_root=tmp_path / "workspaces",
+    )
+    task = dict(evaluator.load()["tasks"][0])
+    task["id"] = "../outside"
+
+    with pytest.raises(ValueError, match="filesystem-safe slug"):
+        evaluator.run_task(task)
+
+    assert not (tmp_path / "outside").exists()
+
+
+def test_run_task_revalidates_setup_path_before_writing_fixture(tmp_path):
+    evaluator = BenchmarkEvaluator(
+        benchmark_path=Path("benchmarks/coding_tasks.json"),
+        artifact_path=tmp_path / "artifact.json",
+        workspace_root=tmp_path / "workspaces",
+    )
+    task = dict(evaluator.load()["tasks"][0])
+    task["setup"] = {"kind": "freshness_mismatch", "path": "../outside.txt"}
+
+    with pytest.raises(ValueError, match="setup.path escapes fixture root"):
+        evaluator.run_task(task)
+
+    assert not (tmp_path / "outside.txt").exists()
+
+
+def test_run_task_rejects_workspace_nested_inside_fixture(tmp_path):
+    repo_root = tmp_path / "repo"
+    fixture = repo_root / "fixture"
+    benchmark_path = repo_root / "benchmarks" / "tasks.json"
+    fixture.mkdir(parents=True)
+    benchmark_path.parent.mkdir()
+    (fixture / "README.md").write_text("demo\n", encoding="utf-8")
+    benchmark_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "tasks": [
+                    {
+                        "id": "nested-workspace",
+                        "prompt": "Inspect README.",
+                        "fixture_repo": "fixture",
+                        "allowed_tools": ["read_file"],
+                        "step_budget": 2,
+                        "expected_artifact": "README exists",
+                        "verifier_argv": ["python", "-V"],
+                        "category": "contract",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    workspace_root = fixture / "generated"
+    evaluator = BenchmarkEvaluator(
+        benchmark_path=benchmark_path,
+        artifact_path=tmp_path / "artifact.json",
+        workspace_root=workspace_root,
+    )
+
+    with pytest.raises(ValueError, match="workspace_root must not be inside fixture_repo"):
+        evaluator.run_task(evaluator.load()["tasks"][0])
+
+    assert not workspace_root.exists()
 
 
 def test_run_fixed_benchmark_reports_metadata_and_success_definition(tmp_path):

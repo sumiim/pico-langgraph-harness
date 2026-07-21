@@ -245,7 +245,7 @@ set "PICO_TEST_TEMP=%TEMP%\pico-full-%RANDOM%"
 python -m pytest -q --basetemp "%PICO_TEST_TEMP%"
 ```
 
-当前测试集包含 225+ 个用例，覆盖 native 兼容、三类意图、Router 协议恢复、角色权限、Review 重试、审计事件、artifact 兼容和跨平台安全边界。
+当前测试集包含 240+ 个用例，覆盖 native 兼容、三类意图、Router 协议恢复、角色权限、Review 重试、审计事件、artifact 兼容和跨平台安全边界。
 
 ## 项目结构
 

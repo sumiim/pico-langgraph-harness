@@ -249,6 +249,7 @@ def run_agent(
                     }
                 },
             )
+            task_state.record_affected_paths(result["affected_paths"])
             budget_task_states = [task_state, *node_child_states]
             measured_steps = sum(state.tool_steps for state in budget_task_states)
             if measured_steps != result["coordinator_steps_used"]:
