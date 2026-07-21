@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pico as pico_pkg
+from pico import cli as cli_module
 from pico import (
     AnthropicCompatibleModelClient,
     FakeModelClient,
@@ -276,6 +277,21 @@ def test_invalid_risky_tool_does_not_prompt_for_approval(tmp_path):
     assert result.startswith("error: invalid arguments for write_file: 'path'")
     assert 'example: <tool name="write_file"' in result
     mock_input.assert_not_called()
+
+
+def test_approval_prompt_displays_unicode_arguments_without_ascii_escapes(tmp_path):
+    agent = build_agent(tmp_path, [], approval_policy="ask")
+
+    with patch("builtins.input", return_value="y") as mock_input:
+        approved = agent.approve(
+            "patch_file",
+            {"path": "README.md", "new_text": "中文项目介绍"},
+        )
+
+    prompt = mock_input.call_args.args[0]
+    assert approved is True
+    assert "中文项目介绍" in prompt
+    assert "\\u4e2d" not in prompt
 
 
 def test_list_files_hides_internal_agent_state(tmp_path):
@@ -727,6 +743,31 @@ def test_build_arg_parser_defaults_provider_to_deepseek(tmp_path):
     args = pico_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path)])
 
     assert args.provider == "deepseek"
+
+
+def test_build_model_client_applies_router_model_and_temperature_overrides(monkeypatch, tmp_path):
+    captured = []
+
+    def fake_client(**kwargs):
+        captured.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(cli_module, "OllamaModelClient", fake_client)
+    monkeypatch.setattr(cli_module, "OpenAICompatibleModelClient", fake_client)
+    monkeypatch.setattr(cli_module, "AnthropicCompatibleModelClient", fake_client)
+
+    for provider in ("ollama", "openai", "anthropic", "deepseek"):
+        args = pico_pkg.build_arg_parser().parse_args(
+            ["--cwd", str(tmp_path), "--provider", provider, "--temperature", "0.7"]
+        )
+        cli_module._build_model_client(
+            args,
+            model_override="router-model",
+            temperature_override=0.0,
+        )
+
+    assert [item["model"] for item in captured] == ["router-model"] * 4
+    assert [item["temperature"] for item in captured] == [0.0] * 4
 
 
 def test_build_arg_parser_accepts_anthropic_provider(tmp_path):

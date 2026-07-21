@@ -54,6 +54,7 @@ class BackendRunResult:
     budget_task_states: list[TaskState] = field(default_factory=list)
     initial_state: dict = field(default_factory=dict)
     events: tuple[dict, ...] = field(default_factory=tuple)
+    run_metadata: dict = field(default_factory=dict)
 
     def __post_init__(self):
         self.child_task_states = list(self.child_task_states or [])
@@ -63,6 +64,7 @@ class BackendRunResult:
             self.budget_task_states = list(self.budget_task_states)
         self.initial_state = dict(self.initial_state or {})
         self.events = tuple(deepcopy(event) for event in (self.events or ()))
+        self.run_metadata = deepcopy(dict(self.run_metadata or {}))
 
 
 def _start_failed_task_state(agent, task):

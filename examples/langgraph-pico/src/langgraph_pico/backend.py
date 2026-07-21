@@ -1,5 +1,6 @@
-"""LangGraph backend adapter for Pico's benchmark harness."""
+"""LangGraph backend adapter for Pico's public runtime and benchmark harness."""
 
+from pathlib import Path, PureWindowsPath
 import time
 
 from pico.evaluation.backends import (
@@ -19,13 +20,42 @@ from pico.task_state import (
     STOP_REASON_MODEL_ERROR,
     STOP_REASON_NO_CHANGES_TO_REVIEW,
     STOP_REASON_PERSISTENCE_ERROR,
+    STOP_REASON_RETRY_LIMIT_REACHED,
     STOP_REASON_REVIEW_RETRY_LIMIT_REACHED,
     STOP_REASON_RUNTIME_ERROR,
+    STOP_REASON_STEP_LIMIT_REACHED,
     TaskState,
 )
 from pico.workspace import now
 
 from .graph import build_graph
+from .intent import (
+    INTENT_CODE_CHANGE,
+    INTENT_CONVERSATION,
+    INTENT_READ_ONLY,
+    TASK_MODE_AUTO,
+    normalize_task_mode,
+)
+
+
+RUN_METADATA_KEYS = (
+    "requested_task_mode",
+    "resolved_intent",
+    "intent_source",
+    "intent_attempts",
+    "answer_attempts",
+)
+
+STOP_REASON_MAP = {
+    "budget_exhausted": STOP_REASON_BUDGET_EXHAUSTED,
+    "delegate_failed": STOP_REASON_DELEGATE_FAILED,
+    "no_changes_to_review": STOP_REASON_NO_CHANGES_TO_REVIEW,
+    "review_retry_limit_reached": STOP_REASON_REVIEW_RETRY_LIMIT_REACHED,
+    "retry_limit_reached": STOP_REASON_RETRY_LIMIT_REACHED,
+    "step_limit_reached": STOP_REASON_STEP_LIMIT_REACHED,
+    "runtime_error": STOP_REASON_RUNTIME_ERROR,
+    "persistence_error": STOP_REASON_PERSISTENCE_ERROR,
+}
 
 
 def _initial_state_snapshot(agent):
@@ -38,14 +68,69 @@ def _initial_state_snapshot(agent):
     }
 
 
+def _materialize_focus_paths(focus_paths):
+    if focus_paths is None:
+        return ()
+    if isinstance(focus_paths, (str, bytes)):
+        raise ValueError("focus_paths must be an iterable of relative path strings")
+    try:
+        values = tuple(focus_paths)
+    except TypeError as exc:
+        raise ValueError("focus_paths must be an iterable of relative path strings") from exc
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("focus_paths must contain non-empty strings")
+    return values
+
+
 def _normalized_focus_paths(agent, focus_paths):
     normalized = []
-    for raw_path in focus_paths or ():
-        path = agent.tool_context().path(str(raw_path).strip())
+    for raw_path in focus_paths:
+        raw = raw_path.strip()
+        if Path(raw).is_absolute() or PureWindowsPath(raw).is_absolute():
+            raise ValueError("focus_paths must be workspace-relative")
+        path = agent.tool_context().path(raw)
         relative = path.relative_to(agent.root).as_posix()
-        if relative and relative not in normalized:
+        if relative in {"", "."}:
+            raise ValueError("focus_paths must identify a file or subdirectory")
+        if relative not in normalized:
             normalized.append(relative)
     return normalized
+
+
+def _intent_context(agent, max_messages=4, max_chars=2000):
+    messages = [
+        item
+        for item in agent.session.get("history", [])
+        if item.get("role") in {"user", "assistant"}
+    ][-max_messages:]
+    lines = [
+        f"{item.get('role', '')}: {item.get('content', '')}"
+        for item in messages
+    ]
+    return agent.redact_text("\n".join(lines))[-max_chars:]
+
+
+def _validate_run_agent_args(
+    *,
+    task_mode,
+    requires_research,
+    raw_focus_paths,
+    acceptance,
+    router_model_client,
+):
+    if requires_research is not None and not isinstance(requires_research, bool):
+        raise ValueError("requires_research must be a boolean or None")
+    has_focus = bool(raw_focus_paths)
+    has_acceptance = acceptance is not None and bool(str(acceptance).strip())
+    if task_mode in {INTENT_CONVERSATION, INTENT_READ_ONLY} and has_focus:
+        raise ValueError(f"focus_paths are not valid for task_mode={task_mode}")
+    if task_mode in {INTENT_CONVERSATION, INTENT_READ_ONLY} and has_acceptance:
+        raise ValueError(f"acceptance is only valid for auto or {INTENT_CODE_CHANGE}")
+    if task_mode == INTENT_CONVERSATION and requires_research is True:
+        raise ValueError("conversation tasks cannot require research")
+    if task_mode != TASK_MODE_AUTO and router_model_client is not None:
+        raise ValueError("router_model_client is only valid for task_mode=auto")
 
 
 def run_agent(
@@ -54,20 +139,31 @@ def run_agent(
     *,
     acceptance=None,
     step_budget=None,
-    requires_research=True,
+    requires_research=None,
     focus_paths=None,
+    task_mode=INTENT_CODE_CHANGE,
+    router_model_client=None,
     record_session=True,
 ):
-    """Run the LangGraph workflow with an already configured Pico instance."""
+    """Run the routed LangGraph workflow with an already configured Pico instance."""
     task_input = str(task_input).strip()
     if not task_input:
         raise ValueError("task_input must not be empty")
-    if not isinstance(requires_research, bool):
-        raise ValueError("requires_research must be a boolean")
+    normalized_mode = normalize_task_mode(task_mode)
+    raw_focus_paths = _materialize_focus_paths(focus_paths)
+    _validate_run_agent_args(
+        task_mode=normalized_mode,
+        requires_research=requires_research,
+        raw_focus_paths=raw_focus_paths,
+        acceptance=acceptance,
+        router_model_client=router_model_client,
+    )
+    if isinstance(step_budget, bool):
+        raise ValueError("step_budget must be a positive integer")
     step_budget = int(agent.max_steps if step_budget is None else step_budget)
     if step_budget < 1:
         raise ValueError("step_budget must be positive")
-    review_paths = _normalized_focus_paths(agent, focus_paths)
+    review_paths = _normalized_focus_paths(agent, raw_focus_paths)
     initial_state = _initial_state_snapshot(agent)
 
     original_sink = agent.event_sink
@@ -77,10 +173,25 @@ def run_agent(
     if not isinstance(original_model_client, HarnessModelClientAdapter):
         agent.model_client = HarnessModelClientAdapter(original_model_client)
 
+    if router_model_client is None or router_model_client is original_model_client:
+        resolved_router_client = agent.model_client
+    elif isinstance(router_model_client, HarnessModelClientAdapter):
+        resolved_router_client = router_model_client
+    else:
+        resolved_router_client = HarnessModelClientAdapter(router_model_client)
+
     task_state = None
     node_child_states = []
     budget_task_states = []
     final_answer = ""
+    result = None
+    run_metadata_collector = {
+        "requested_task_mode": normalized_mode,
+        "resolved_intent": "",
+        "intent_source": "",
+        "intent_attempts": 0,
+        "answer_attempts": 0,
+    }
     try:
         if record_session:
             agent.memory.set_task_summary(task_input)
@@ -94,12 +205,23 @@ def run_agent(
         agent.current_task_state = task_state
         agent.current_run_dir = agent.run_store.start_run(task_state)
         agent.child_task_states = []
-        agent.emit_trace(task_state, "run_started", {"user_request": task_input, "backend": "langgraph"})
+        agent.emit_trace(
+            task_state,
+            "run_started",
+            {"user_request": task_input, "backend": "langgraph"},
+        )
         started_at = time.monotonic()
         budget_task_states = [task_state]
         graph_state = {
             "task": task_input,
             "acceptance": str(acceptance or task_input),
+            "requested_task_mode": normalized_mode,
+            "resolved_intent": "",
+            "intent_source": "",
+            "intent_attempts": 0,
+            "answer_attempts": 0,
+            "intent_context": _intent_context(agent),
+            "completion_status": "pending",
             "step_budget": step_budget,
             "coordinator_steps_used": 0,
             "delegate_failures": 0,
@@ -118,22 +240,28 @@ def run_agent(
         try:
             result = build_graph().invoke(
                 graph_state,
-                config={"configurable": {"agent": agent, "node_child_states": node_child_states}},
+                config={
+                    "configurable": {
+                        "agent": agent,
+                        "router_model_client": resolved_router_client,
+                        "node_child_states": node_child_states,
+                        "run_metadata_collector": run_metadata_collector,
+                    }
+                },
             )
             budget_task_states = [task_state, *node_child_states]
             measured_steps = sum(state.tool_steps for state in budget_task_states)
             if measured_steps != result["coordinator_steps_used"]:
                 raise RuntimeError("graph budget counter drift")
+            expected_metadata = {key: result[key] for key in RUN_METADATA_KEYS}
+            if run_metadata_collector != expected_metadata:
+                raise RuntimeError("graph run metadata drift")
+
             final_answer = result["final_result"]
-            if result["review_status"] == "pass" and not result["terminal_reason"]:
+            if result["completion_status"] == "success" and not result["terminal_reason"]:
                 task_state.finish_success(final_answer)
             else:
-                stop_reason = {
-                    "no_changes_to_review": STOP_REASON_NO_CHANGES_TO_REVIEW,
-                    "review_retry_limit_reached": STOP_REASON_REVIEW_RETRY_LIMIT_REACHED,
-                    "budget_exhausted": STOP_REASON_BUDGET_EXHAUSTED,
-                    "delegate_failed": STOP_REASON_DELEGATE_FAILED,
-                }[result["terminal_reason"]]
+                stop_reason = STOP_REASON_MAP[result["terminal_reason"]]
                 task_state.stop(stop_reason, status=STATUS_FAILED, final_answer=final_answer)
         except Exception as exc:
             final_answer = f"LangGraph execution failed: {type(exc).__name__}"
@@ -172,6 +300,7 @@ def run_agent(
             budget_task_states=budget_task_states,
             initial_state=initial_state,
             events=collector.snapshot(),
+            run_metadata=run_metadata_collector,
         )
     finally:
         agent.event_sink = original_sink
@@ -213,6 +342,7 @@ class LangGraphBackendRunner:
         return run_agent(
             agent,
             task["prompt"],
+            task_mode=INTENT_CODE_CHANGE,
             acceptance=task.get("acceptance", task["prompt"]),
             step_budget=int(task["step_budget"]),
             requires_research=requires_research,

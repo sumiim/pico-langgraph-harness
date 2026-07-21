@@ -728,7 +728,7 @@ class Pico:
         if self.approval_policy == "never":
             return False
         try:
-            answer = input(f"approve {name} {json.dumps(args, ensure_ascii=True)}? [y/N] ")
+            answer = input(f"approve {name} {json.dumps(args, ensure_ascii=False)}? [y/N] ")
         except EOFError:
             return False
         return answer.strip().lower() in {"y", "yes"}

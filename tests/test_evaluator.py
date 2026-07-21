@@ -322,6 +322,56 @@ def test_v1_evaluation_artifact_is_normalized_for_readers():
     assert normalized["backend"] == "native"
     assert normalized["benchmark"]["schema_version"] == 1
     assert normalized["rows"][0]["events"] == []
+    assert normalized["rows"][0]["requested_task_mode"] == ""
+    assert normalized["rows"][0]["resolved_intent"] == ""
+    assert normalized["rows"][0]["intent_source"] == ""
+    assert normalized["rows"][0]["intent_attempts"] == 0
+    assert normalized["rows"][0]["answer_attempts"] == 0
+
+
+def test_old_v2_artifact_gets_route_defaults_without_recomputing_summary():
+    original_summary = {"sentinel": "preserved", "failure_category_counts": {}}
+    normalized = normalize_evaluation_artifact(
+        {
+            "schema_version": 2,
+            "backend": "native",
+            "benchmark": {"schema_version": 1},
+            "rows": [{"id": "old-v2", "status": "pass"}],
+            "summary": original_summary,
+            "failure_category_counts": {},
+        }
+    )
+
+    assert normalized["summary"] is original_summary
+    assert normalized["rows"][0]["requested_task_mode"] == ""
+    assert normalized["rows"][0]["resolved_intent"] == ""
+    assert normalized["rows"][0]["intent_source"] == ""
+    assert normalized["rows"][0]["intent_attempts"] == 0
+    assert normalized["rows"][0]["answer_attempts"] == 0
+
+
+def test_normal_skipped_and_harness_rows_share_route_metadata_fields(tmp_path):
+    evaluator = BenchmarkEvaluator(
+        benchmark_path=Path("benchmarks/coding_tasks.json"),
+        artifact_path=tmp_path / "artifact.json",
+        workspace_root=tmp_path / "workspaces",
+    )
+    task = evaluator.load()["tasks"][0]
+    normal = evaluator.run_task(task)
+    skipped = evaluator._skipped_row(task)
+    harness = evaluator._harness_failure_row(task, "RuntimeError")
+    route_keys = {
+        "requested_task_mode",
+        "resolved_intent",
+        "intent_source",
+        "intent_attempts",
+        "answer_attempts",
+    }
+
+    assert route_keys <= normal.keys()
+    assert normal["requested_task_mode"] == ""
+    assert route_keys <= skipped.keys()
+    assert route_keys <= harness.keys()
 
 
 def test_backend_not_applicable_returns_uniform_skipped_row(tmp_path):

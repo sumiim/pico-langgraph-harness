@@ -692,6 +692,7 @@ class BenchmarkEvaluator:
         events = list(backend_result.events)
         event_metrics = _event_metrics(events)
         initial_state = backend_result.initial_state
+        run_metadata = dict(backend_result.run_metadata or {})
 
         row = {
             "id": task["id"],
@@ -734,6 +735,11 @@ class BenchmarkEvaluator:
             "initial_memory_empty": initial_state.get("initial_memory_empty"),
             "initial_task_summary_empty": initial_state.get("initial_task_summary_empty"),
             "initial_episodic_notes_empty": initial_state.get("initial_episodic_notes_empty"),
+            "requested_task_mode": run_metadata.get("requested_task_mode", ""),
+            "resolved_intent": run_metadata.get("resolved_intent", ""),
+            "intent_source": run_metadata.get("intent_source", ""),
+            "intent_attempts": int(run_metadata.get("intent_attempts", 0)),
+            "answer_attempts": int(run_metadata.get("answer_attempts", 0)),
             "execution_started": True,
             "task_state": task_state.to_dict(),
             "child_task_states": [state.to_dict() for state in backend_result.child_task_states],
@@ -825,6 +831,11 @@ class BenchmarkEvaluator:
             "review_calls": 0,
             "review_passed": None,
             "review_retries": 0,
+            "requested_task_mode": "",
+            "resolved_intent": "",
+            "intent_source": "",
+            "intent_attempts": 0,
+            "answer_attempts": 0,
         }
 
     def _skipped_row(self, task):
@@ -913,17 +924,18 @@ def normalize_evaluation_artifact(payload):
     if not isinstance(payload, dict):
         raise ValueError("evaluation artifact must be a mapping")
     version = int(payload.get("schema_version", 0))
-    if version == EVALUATION_ARTIFACT_SCHEMA_VERSION:
-        return dict(payload)
-    if version != 1:
+    if version not in {1, EVALUATION_ARTIFACT_SCHEMA_VERSION}:
         raise ValueError(f"unsupported evaluation artifact schema_version: {version}")
 
     normalized = dict(payload)
-    normalized["schema_version"] = EVALUATION_ARTIFACT_SCHEMA_VERSION
-    normalized.setdefault("backend", "native")
-    benchmark = dict(normalized.get("benchmark", {}))
-    benchmark.setdefault("schema_version", BENCHMARK_SCHEMA_VERSION)
-    normalized["benchmark"] = benchmark
+    upgraded_from_v1 = version == 1
+    if upgraded_from_v1:
+        normalized["schema_version"] = EVALUATION_ARTIFACT_SCHEMA_VERSION
+        normalized.setdefault("backend", "native")
+        benchmark = dict(normalized.get("benchmark", {}))
+        benchmark.setdefault("schema_version", BENCHMARK_SCHEMA_VERSION)
+        normalized["benchmark"] = benchmark
+
     rows = [dict(row) for row in normalized.get("rows", [])]
     for row in rows:
         row.setdefault("backend", "native")
@@ -931,9 +943,18 @@ def normalize_evaluation_artifact(payload):
         row.setdefault("events", [])
         row.setdefault("child_task_states", [])
         row.setdefault("budget_task_states", [row.get("task_state", {})] if row.get("task_state") else [])
+        row.setdefault("requested_task_mode", "")
+        row.setdefault("resolved_intent", "")
+        row.setdefault("intent_source", "")
+        row.setdefault("intent_attempts", 0)
+        row.setdefault("answer_attempts", 0)
     normalized["rows"] = rows
-    normalized["summary"] = summarize_rows(rows)
-    normalized["failure_category_counts"] = normalized["summary"]["failure_category_counts"]
+    if upgraded_from_v1 or "summary" not in normalized:
+        normalized["summary"] = summarize_rows(rows)
+    normalized.setdefault(
+        "failure_category_counts",
+        normalized["summary"]["failure_category_counts"],
+    )
     return normalized
 
 

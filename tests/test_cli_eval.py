@@ -1,6 +1,8 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from pico import cli
 
 
@@ -9,6 +11,8 @@ def test_public_run_parser_keeps_legacy_shape(tmp_path):
 
     assert args.prompt == ["legacy prompt"]
     assert args.backend == "native"
+    assert args.task_mode == "auto"
+    assert args.requires_research is None
     assert not hasattr(args, "command")
 
 
@@ -103,9 +107,16 @@ def test_run_request_lazily_dispatches_to_langgraph(monkeypatch):
         max_steps=7,
         requires_research=False,
         focus_paths=["README.md"],
+        task_mode="code_change",
     )
+    router_model_client = object()
 
-    answer, succeeded, stop_reason = cli._run_request(agent, "change README", args)
+    answer, succeeded, stop_reason = cli._run_request(
+        agent,
+        "change README",
+        args,
+        router_model_client,
+    )
 
     assert answer == "graph answer"
     assert succeeded is True
@@ -117,5 +128,90 @@ def test_run_request_lazily_dispatches_to_langgraph(monkeypatch):
         "step_budget": 7,
         "requires_research": False,
         "focus_paths": ["README.md"],
+        "task_mode": "code_change",
+        "router_model_client": router_model_client,
         "record_session": True,
     }
+
+
+def test_run_request_native_path_does_not_import_langgraph(monkeypatch):
+    imported = []
+    original_import = __import__
+
+    def recording_import(name, *args, **kwargs):
+        imported.append(name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", recording_import)
+    agent = SimpleNamespace(
+        ask=lambda prompt: "native answer",
+        current_task_state=SimpleNamespace(stop_reason="final_answer_returned"),
+    )
+
+    cli._run_request(agent, "hello", SimpleNamespace(backend="native"))
+
+    assert not any(name.startswith("langgraph_pico") for name in imported)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--backend", "native", "--research", "task"],
+        ["--backend", "native", "--task-mode", "read_only", "task"],
+        ["--backend", "langgraph", "--task-mode", "read_only", "--router-model", "router", "task"],
+        ["--backend", "langgraph", "--task-mode", "conversation", "--research", "task"],
+        ["--backend", "langgraph", "--task-mode", "conversation", "--focus-path", "README.md", "task"],
+    ],
+)
+def test_invalid_langgraph_cli_combinations_fail_before_agent_construction(monkeypatch, argv):
+    monkeypatch.setattr(cli, "build_agent", lambda args: pytest.fail("agent must not be built"))
+
+    with pytest.raises(SystemExit) as caught:
+        cli.main(argv)
+
+    assert caught.value.code == 2
+
+
+def test_cli_auto_builds_independent_zero_temperature_router_client(monkeypatch):
+    main_client = SimpleNamespace(model="main-model", temperature=0.2, host="local")
+    router_client = object()
+    agent = SimpleNamespace(model_client=main_client)
+    build_calls = []
+    dispatched = {}
+
+    monkeypatch.setattr(cli, "build_agent", lambda args: agent)
+    monkeypatch.setattr(cli, "build_welcome", lambda *args, **kwargs: "")
+
+    def fake_build_model_client(args, **kwargs):
+        build_calls.append(kwargs)
+        return router_client
+
+    def fake_run_request(agent_arg, prompt, args, router_model_client=None):
+        dispatched.update(
+            {
+                "agent": agent_arg,
+                "prompt": prompt,
+                "router_model_client": router_model_client,
+            }
+        )
+        return "answer", True, "final_answer_returned"
+
+    monkeypatch.setattr(cli, "_build_model_client", fake_build_model_client)
+    monkeypatch.setattr(cli, "_run_request", fake_run_request)
+
+    assert cli.main(
+        [
+            "--backend",
+            "langgraph",
+            "--task-mode",
+            "auto",
+            "--router-model",
+            "router-model",
+            "hello",
+        ]
+    ) == 0
+
+    assert build_calls == [{"model_override": "router-model", "temperature_override": 0.0}]
+    assert dispatched["router_model_client"] is router_client
+    assert main_client.model == "main-model"
+    assert main_client.temperature == 0.2
