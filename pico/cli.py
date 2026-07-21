@@ -102,12 +102,13 @@ def _configured_secret_names(args):
     return sorted(configured_secret_names)
 
 
-def _build_model_client(args):
+def _build_model_client(args, *, model_override=None, temperature_override=None):
     provider = getattr(args, "provider", "deepseek")
+    temperature = args.temperature if temperature_override is None else temperature_override
     # CLI 只负责把 provider 选择翻译成具体 client。
     # 真正的提示词格式、缓存支持、HTTP 协议差异，都封装在 models.py 里。
     if provider == "openai":
-        model = _effective_model(args, provider)
+        model = model_override or _effective_model(args, provider)
         base_url = getattr(args, "base_url", None) or provider_env("PICO_OPENAI_API_BASE", ("OPENAI_API_BASE",), DEFAULT_OPENAI_BASE_URL)
         api_key = provider_env(
             "PICO_OPENAI_API_KEY",
@@ -117,11 +118,11 @@ def _build_model_client(args):
             model=model,
             base_url=base_url,
             api_key=api_key,
-            temperature=args.temperature,
+            temperature=temperature,
             timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
         )
     if provider == "anthropic":
-        model = _effective_model(args, provider)
+        model = model_override or _effective_model(args, provider)
         base_url = getattr(args, "base_url", None) or provider_env("PICO_ANTHROPIC_API_BASE", ("ANTHROPIC_API_BASE",), DEFAULT_ANTHROPIC_BASE_URL)
         api_key = provider_env(
             "PICO_ANTHROPIC_API_KEY",
@@ -131,27 +132,27 @@ def _build_model_client(args):
             model=model,
             base_url=base_url,
             api_key=api_key,
-            temperature=args.temperature,
+            temperature=temperature,
             timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
         )
     if provider == "deepseek":
-        model = _effective_model(args, provider)
+        model = model_override or _effective_model(args, provider)
         base_url = getattr(args, "base_url", None) or provider_env("PICO_DEEPSEEK_API_BASE", ("DEEPSEEK_API_BASE",), DEFAULT_DEEPSEEK_BASE_URL)
         api_key = provider_env("PICO_DEEPSEEK_API_KEY", ("DEEPSEEK_API_KEY",))
         return AnthropicCompatibleModelClient(
             model=model,
             base_url=base_url,
             api_key=api_key,
-            temperature=args.temperature,
+            temperature=temperature,
             timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
         )
 
-    model = _effective_model(args, provider)
+    model = model_override or _effective_model(args, provider)
     host = getattr(args, "host", DEFAULT_OLLAMA_HOST)
     return OllamaModelClient(
         model=model,
         host=host,
-        temperature=args.temperature,
+        temperature=temperature,
         top_p=args.top_p,
         timeout=args.ollama_timeout,
     )
@@ -258,8 +259,19 @@ def build_arg_parser():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description="Minimal coding agent for DeepSeek, OpenAI-compatible, Anthropic-compatible, or Ollama models.",
     )
+    _add_run_arguments(parser)
+    return parser
+
+
+def _add_run_arguments(parser):
     parser.add_argument("prompt", nargs="*", help="Optional one-shot prompt.")
     parser.add_argument("--cwd", default=".", help="Workspace directory.")
+    parser.add_argument(
+        "--backend",
+        choices=("native", "langgraph"),
+        default="native",
+        help="Agent orchestration backend.",
+    )
     parser.add_argument("--provider", choices=("ollama", "openai", "anthropic", "deepseek"), default="deepseek", help="Model backend to use.")
     parser.add_argument(
         "--model",
@@ -279,12 +291,142 @@ def build_arg_parser():
         default=[],
         help="Extra environment variable names to treat as secrets for trace/report redaction.",
     )
-    parser.add_argument("--max-steps", type=int, default=6, help="Maximum tool/model iterations per request.")
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=6,
+        help="Maximum native tool calls or LangGraph Coordinator tool steps per request.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
+    parser.add_argument(
+        "--task-mode",
+        choices=("auto", "conversation", "read_only", "code_change"),
+        default="auto",
+        help="LangGraph task intent; auto uses the constrained intent router.",
+    )
+    parser.add_argument(
+        "--router-model",
+        default=None,
+        help="Model name override for LangGraph auto intent routing.",
+    )
+    parser.add_argument(
+        "--acceptance",
+        default=None,
+        help="Acceptance criteria for the LangGraph review role. Defaults to the prompt.",
+    )
+    parser.add_argument(
+        "--focus-path",
+        dest="focus_paths",
+        action="append",
+        default=[],
+        help="Workspace-relative review path for LangGraph; may be repeated.",
+    )
+    parser.add_argument(
+        "--research",
+        dest="requires_research",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable the LangGraph research delegate.",
+    )
     parser.add_argument("--quiet", action="store_true", help="Hide per-step progress messages.")
+
+
+def _add_eval_subcommand(subparsers):
+    parser = subparsers.add_parser("eval", help="run eval harness against benchmark tasks")
+    parser.add_argument("--tasks", default="benchmarks/coding_tasks.json")
+    parser.add_argument("--out", default=None, help="output JSON (default: benchmarks/results/<ts>-eval.json)")
+    parser.add_argument("--backend", choices=("native", "langgraph"), default="native")
+
+
+def _build_command_parser():
+    parser = argparse.ArgumentParser(description="Pico coding agent and evaluation harness.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    run_parser = subparsers.add_parser("run", help="run the Pico agent")
+    _add_run_arguments(run_parser)
+    _add_eval_subcommand(subparsers)
     return parser
+
+
+def _run_eval(args):
+    from datetime import datetime
+    from pathlib import Path
+
+    from .evaluation.evaluator import run_fixed_benchmark
+
+    output_path = args.out or f"benchmarks/results/{datetime.now().strftime('%Y%m%d-%H%M%S')}-eval.json"
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    result = run_fixed_benchmark(
+        benchmark_path=args.tasks,
+        artifact_path=output_path,
+        backend=args.backend,
+    )
+    summary = result["summary"]
+    print(
+        f"tasks:{summary['total_tasks']}  passed:{summary['passed']}  "
+        f"failed:{summary['failed']}  ({summary['pass_rate']:.0%})"
+    )
+    print(f"-> {output_path}")
+    if summary["eligible_tasks"] == 0:
+        return 2
+    return 0 if summary["failed"] == 0 else 1
+
+
+def _validate_run_args(args):
+    backend = getattr(args, "backend", "native")
+    task_mode = getattr(args, "task_mode", "auto")
+    router_model = getattr(args, "router_model", None)
+    requires_research = getattr(args, "requires_research", None)
+    focus_paths = getattr(args, "focus_paths", ())
+    acceptance = getattr(args, "acceptance", None)
+
+    if backend == "native":
+        if task_mode != "auto":
+            raise ValueError("--task-mode is only valid with --backend langgraph")
+        if router_model is not None:
+            raise ValueError("--router-model is only valid with --backend langgraph")
+        if requires_research is not None:
+            raise ValueError("--research/--no-research is only valid with --backend langgraph")
+        if focus_paths:
+            raise ValueError("--focus-path is only valid with --backend langgraph")
+        if acceptance is not None:
+            raise ValueError("--acceptance is only valid with --backend langgraph")
+        return
+
+    if router_model is not None and task_mode != "auto":
+        raise ValueError("--router-model requires --task-mode auto")
+    if task_mode in {"conversation", "read_only"} and focus_paths:
+        raise ValueError(f"--focus-path is not valid with --task-mode {task_mode}")
+    if task_mode in {"conversation", "read_only"} and acceptance is not None:
+        raise ValueError(f"--acceptance is not valid with --task-mode {task_mode}")
+    if task_mode == "conversation" and requires_research is True:
+        raise ValueError("--research is not valid with --task-mode conversation")
+
+
+def _run_request(agent, prompt, args, router_model_client=None):
+    if getattr(args, "backend", "native") == "native":
+        answer = agent.ask(prompt)
+        return answer, True, agent.current_task_state.stop_reason
+    try:
+        from langgraph_pico import run_agent
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "langgraph backend is optional; install examples/langgraph-pico first"
+        ) from exc
+    result = run_agent(
+        agent,
+        prompt,
+        acceptance=getattr(args, "acceptance", None),
+        step_budget=args.max_steps,
+        requires_research=getattr(args, "requires_research", None),
+        focus_paths=getattr(args, "focus_paths", ()),
+        task_mode=getattr(args, "task_mode", "auto"),
+        router_model_client=router_model_client,
+        record_session=True,
+    )
+    succeeded = result.task_state.status == "completed"
+    return result.final_answer, succeeded, result.task_state.stop_reason
 
 
 def print_progress(message):
@@ -292,8 +434,27 @@ def print_progress(message):
 
 
 def main(argv=None):
-    args = build_arg_parser().parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in {"run", "eval"}:
+        parser = _build_command_parser()
+        args = parser.parse_args(argv)
+        if args.command == "eval":
+            return _run_eval(args)
+    else:
+        parser = build_arg_parser()
+        args = parser.parse_args(argv)
+    try:
+        _validate_run_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     agent = build_agent(args)
+    router_model_client = None
+    if args.backend == "langgraph" and args.task_mode == "auto":
+        router_model_client = _build_model_client(
+            args,
+            model_override=args.router_model,
+            temperature_override=0.0,
+        )
 
     model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_OLLAMA_MODEL))
     host = getattr(agent.model_client, "host", getattr(agent.model_client, "base_url", getattr(args, "host", DEFAULT_OLLAMA_HOST)))
@@ -305,7 +466,16 @@ def main(argv=None):
         if prompt:
             print()
             try:
-                print(agent.ask(prompt))
+                answer, succeeded, stop_reason = _run_request(
+                    agent,
+                    prompt,
+                    args,
+                    router_model_client,
+                )
+                print(answer)
+                if not succeeded:
+                    print(f"[pico] stopped: {stop_reason}", file=sys.stderr)
+                    return 1
             except RuntimeError as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
@@ -340,6 +510,14 @@ def main(argv=None):
 
         print()
         try:
-            print(agent.ask(user_input))
+            answer, succeeded, stop_reason = _run_request(
+                agent,
+                user_input,
+                args,
+                router_model_client,
+            )
+            print(answer)
+            if not succeeded:
+                print(f"[pico] stopped: {stop_reason}", file=sys.stderr)
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)

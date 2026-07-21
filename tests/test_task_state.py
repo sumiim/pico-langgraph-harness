@@ -73,3 +73,16 @@ def test_task_state_snapshot_keeps_checkpoint_reference_without_body():
     assert snapshot["resume_status"] == "full-valid"
     assert "current_goal" not in snapshot
     assert "next_step" not in snapshot
+
+
+def test_task_state_round_trips_harness_counters_and_affected_paths():
+    state = TaskState.create(run_id="run_007", task_id="task_007", user_request="Patch files.")
+    state.record_sandbox_violation()
+    state.record_malformed_output_recovered()
+    state.record_affected_paths(["b.py", "a.py", "b.py", ""])
+
+    restored = TaskState.from_dict(state.to_dict())
+
+    assert restored.sandbox_violations == 1
+    assert restored.malformed_output_recovered == 1
+    assert restored.affected_paths == ["a.py", "b.py"]

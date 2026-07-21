@@ -1,10 +1,11 @@
 import os
-import shlex
-import sys
 from unittest.mock import patch
+
+import pytest
 
 from pico import FakeModelClient, Pico, SessionStore, WorkspaceContext
 from pico import cli as pico_cli
+from pico.event_sink import CompositeSink, EventCollector, NullSink
 from pico.task_state import TaskState
 
 
@@ -38,7 +39,12 @@ def test_workspace_escape_is_rejected(tmp_path):
 def test_symlink_path_traversal_is_rejected(tmp_path):
     outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
     outside.write_text("outside\n", encoding="utf-8")
-    (tmp_path / "linked.txt").symlink_to(outside)
+    try:
+        (tmp_path / "linked.txt").symlink_to(outside)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows account cannot create symbolic links")
+        raise
     agent = build_agent(tmp_path, [])
 
     result = agent.run_tool("read_file", {"path": "linked.txt"})
@@ -52,6 +58,45 @@ def test_risky_tool_deny_behavior(tmp_path):
     result = agent.run_tool("run_shell", {"command": "echo hi", "timeout": 20})
 
     assert result == "error: approval denied for run_shell"
+
+
+def test_path_escape_is_counted_and_emitted(tmp_path):
+    collector = EventCollector()
+    agent = build_agent(tmp_path, [], event_sink=CompositeSink(collector, NullSink()))
+    state = TaskState.create(run_id="run_path_escape", task_id="task_path_escape", user_request="Escape")
+    agent.current_task_state = state
+    agent.run_store.start_run(state)
+
+    result = agent.run_tool("read_file", {"path": "../outside.txt"})
+
+    assert "path escapes workspace" in result
+    assert state.sandbox_violations == 1
+    event = next(item for item in collector.snapshot() if item["event"] == "sandbox_violation")
+    assert event["security_event_type"] == "path_escape"
+    assert event["agent_role"] == "coordinator"
+
+
+def test_read_only_block_is_counted_with_delegate_role(tmp_path):
+    collector = EventCollector()
+    agent = build_agent(
+        tmp_path,
+        [],
+        approval_policy="never",
+        read_only=True,
+        event_sink=CompositeSink(collector, NullSink()),
+    )
+    agent.agent_role = "review"
+    state = TaskState.create(run_id="run_read_only", task_id="task_read_only", user_request="Do not write")
+    agent.current_task_state = state
+    agent.run_store.start_run(state)
+
+    result = agent.run_tool("write_file", {"path": "blocked.txt", "content": "no"})
+
+    assert result == "error: approval denied for write_file"
+    assert state.sandbox_violations == 1
+    event = next(item for item in collector.snapshot() if item["event"] == "sandbox_violation")
+    assert event["security_event_type"] == "read_only_block"
+    assert event["agent_role"] == "review"
 
 
 def test_cli_build_agent_wires_secret_env_names_from_parser(tmp_path):
@@ -143,11 +188,11 @@ def test_cli_build_agent_reads_secret_names_from_environment_config(tmp_path):
         assert agent.secret_env_summary()["secret_env_names"] == ["PICO_CUSTOM_SECRET"]
 
 
-def test_run_shell_uses_allowlisted_environment_only(tmp_path):
+def test_run_shell_uses_allowlisted_environment_only(tmp_path, python_shell_command):
     secret = "shh-allowlist-secret"
     agent = build_agent(tmp_path, [], approval_policy="auto")
     script = 'import os; print(os.getenv("PICO_ALLOWLIST_SECRET", "missing"))'
-    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    command = python_shell_command(script)
 
     with patch.dict(os.environ, {"PICO_ALLOWLIST_SECRET": secret}, clear=False):
         result = agent.run_tool("run_shell", {"command": command, "timeout": 20})

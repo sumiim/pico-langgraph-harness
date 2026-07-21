@@ -1,12 +1,14 @@
 import hashlib
 import json
 import locale as locale_module
+import re
 import shutil
 import subprocess
 import tempfile
-from datetime import datetime
-from pathlib import Path
-from zoneinfo import ZoneInfo
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path, PureWindowsPath
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..features import memory as memorylib
 from ..providers.clients import FakeModelClient
@@ -15,8 +17,11 @@ from ..run_store import RunStore
 from ..task_state import STOP_REASON_FINAL_ANSWER_RETURNED
 from ..tools import legal_tool_names
 from ..workspace import WorkspaceContext
+from .backends import build_backend_runner
+from .verifier import VerifierRunner
 
 BENCHMARK_SCHEMA_VERSION = 1
+EVALUATION_ARTIFACT_SCHEMA_VERSION = 2
 DEFAULT_BENCHMARK_PATH = Path("benchmarks/coding_tasks.json")
 DEFAULT_ARTIFACT_PATH = Path("benchmarks/benchmark-v1.json")
 DEFAULT_HARNESS_REGRESSION_V2_ARTIFACT_PATH = Path("artifacts/harness-regression-v2.json")
@@ -26,6 +31,15 @@ DEFAULT_TEMPERATURE = 0.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_MAX_NEW_TOKENS = 64
 DEFAULT_TIMEZONE = "Asia/Shanghai"
+TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+WINDOWS_RESERVED_TASK_IDS = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
 
 REQUIRED_BENCHMARK_KEYS = ("schema_version", "tasks")
 REQUIRED_TASK_KEYS = (
@@ -35,7 +49,6 @@ REQUIRED_TASK_KEYS = (
     "allowed_tools",
     "step_budget",
     "expected_artifact",
-    "verifier",
     "category",
 )
 
@@ -44,7 +57,7 @@ TASK_FIXTURE_ARTIFACTS = {
     "bench_repo_patch": "sample.txt",
 }
 
-SCRIPTED_MODEL_OUTPUTS = {
+NATIVE_SCRIPTED_MODEL_OUTPUTS = {
     "readme_intro_locked": [
         '<tool name="patch_file" path="README.md"><old_text>This is a placeholder benchmark fixture.</old_text><new_text>This fixture is a locked benchmark workspace.</new_text></tool>',
         "<final>Done.</final>",
@@ -101,6 +114,47 @@ SCRIPTED_MODEL_OUTPUTS = {
     "durable_promotion_reject": [
         "<final>Project convention: Keep verifier outcomes stable across reruns.\nDependency: API key is sk-benchmark-secret.\nDecision: Current goal is debug the harness.</final>",
     ],
+    "default_delegate_write_readonly_block": [
+        '<tool>{"name":"delegate","args":{"task":"Try to write a marker to sample.txt, then report the result.","max_steps":3}}</tool>',
+        '<tool>{"name":"write_file","args":{"path":"sample.txt","content":"unsafe"}}</tool>',
+        "<final>The write was denied by the read-only delegate sandbox.</final>",
+        '<tool name="patch_file" path="sample.txt"><old_text>placeholder</old_text><new_text>readonly-guarded</new_text></tool>',
+        "<final>Done.</final>",
+    ],
+}
+
+LANGGRAPH_SCRIPTED_MODEL_OUTPUTS = {
+    "research_then_patch": [
+        '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":20}}</tool>',
+        "<final>Findings: README.md contains the placeholder opening.\nCandidate files: README.md\nSuggested action: replace the placeholder sentence.</final>",
+        '<tool name="patch_file" path="README.md"><old_text>This is a placeholder benchmark fixture.</old_text><new_text>This fixture was updated after delegated research.</new_text></tool>',
+        "<final>Updated README.md from the research findings.</final>",
+        '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":20}}</tool>',
+        "<final>status: pass\nissues: none\nverify_targets: README.md</final>",
+    ],
+    "review_catches_incomplete_fix": [
+        '<tool name="patch_file" path="sample.txt"><old_text>beta</old_text><new_text>beta-reviewed</new_text></tool>',
+        "<final>Updated beta.</final>",
+        '<tool>{"name":"read_file","args":{"path":"sample.txt","start":1,"end":10}}</tool>',
+        "<final>status: needs_fix\nissue: gamma is not yet reviewed\nverify_targets: sample.txt</final>",
+        '<tool name="patch_file" path="sample.txt"><old_text>gamma</old_text><new_text>gamma-reviewed</new_text></tool>',
+        "<final>Completed the missing gamma update.</final>",
+        '<tool>{"name":"read_file","args":{"path":"sample.txt","start":1,"end":10}}</tool>',
+        "<final>status: pass\nissues: none\nverify_targets: sample.txt</final>",
+    ],
+    "delegate_write_denied": [
+        '<tool>{"name":"write_file","args":{"path":"sample.txt","content":"unsafe"}}</tool>',
+        "<final>Findings: the research role could not write because write_file is not allowed.\nCandidate files: sample.txt\nSuggested action: let the executor apply the safe patch.</final>",
+        '<tool name="patch_file" path="sample.txt"><old_text>placeholder</old_text><new_text>delegate-write-denied</new_text></tool>',
+        "<final>Applied the safe executor patch.</final>",
+        '<tool>{"name":"read_file","args":{"path":"sample.txt","start":1,"end":10}}</tool>',
+        "<final>status: pass\nissues: none\nverify_targets: sample.txt</final>",
+    ],
+}
+
+SCRIPTED_MODEL_OUTPUTS = {
+    "native": NATIVE_SCRIPTED_MODEL_OUTPUTS,
+    "langgraph": LANGGRAPH_SCRIPTED_MODEL_OUTPUTS,
 }
 
 
@@ -127,10 +181,19 @@ def _current_locale():
 
 
 def _now_in_timezone(timezone_name):
-    return datetime.now(ZoneInfo(timezone_name)).strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        timezone_info = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        if timezone_name != DEFAULT_TIMEZONE:
+            raise
+        timezone_info = timezone(timedelta(hours=8), name=DEFAULT_TIMEZONE)
+    return datetime.now(timezone_info).strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
 def _artifact_path_for_task(task):
+    explicit_path = str(task.get("artifact_path", "")).strip()
+    if explicit_path:
+        return explicit_path
     fixture_repo_name = Path(str(task["fixture_repo"])).name
     if fixture_repo_name not in TASK_FIXTURE_ARTIFACTS:
         raise ValueError(f"unsupported fixture repo for artifact lookup: {fixture_repo_name}")
@@ -141,11 +204,86 @@ def _workspace_relative(path, workspace_root):
     return str(Path(path).resolve().relative_to(Path(workspace_root).resolve()))
 
 
-def _scripted_outputs_for_task(task):
-    outputs = SCRIPTED_MODEL_OUTPUTS.get(task["id"])
+def _scripted_outputs_for_task(task, backend="native"):
+    outputs = SCRIPTED_MODEL_OUTPUTS.get(backend, {}).get(task["id"])
     if outputs is None:
-        raise ValueError(f"no scripted model outputs for benchmark task: {task['id']}")
+        raise ValueError(f"no scripted model outputs for {backend} benchmark task: {task['id']}")
     return list(outputs)
+
+
+def _normalized_relative_path(value, fixture_repo, task_id, field):
+    if not isinstance(value, str):
+        raise ValueError(f"benchmark task {task_id} {field} must be a string")
+    raw = value.strip()
+    if not raw:
+        raise ValueError(f"benchmark task {task_id} {field} must not be empty")
+    candidate = Path(raw)
+    if candidate.is_absolute() or PureWindowsPath(raw).is_absolute():
+        raise ValueError(f"benchmark task {task_id} {field} must be relative")
+    fixture_root = Path(fixture_repo).resolve()
+    resolved = (fixture_root / candidate).resolve()
+    try:
+        relative = resolved.relative_to(fixture_root)
+    except ValueError as exc:
+        raise ValueError(f"benchmark task {task_id} {field} escapes fixture root") from exc
+    if not relative.parts:
+        raise ValueError(f"benchmark task {task_id} {field} must name a path")
+    return relative.as_posix()
+
+
+def _normalized_task_id(value):
+    if not isinstance(value, str):
+        raise ValueError("benchmark task id must be a string")
+    task_id = value.strip()
+    windows_stem = task_id.split(".", 1)[0].upper()
+    if (
+        not TASK_ID_PATTERN.fullmatch(task_id)
+        or task_id.endswith(".")
+        or windows_stem in WINDOWS_RESERVED_TASK_IDS
+    ):
+        raise ValueError(
+            "benchmark task id must be a filesystem-safe slug using letters, numbers, '.', '_' or '-'"
+        )
+    return task_id
+
+
+def _normalized_fixture_repo(value, repo_root, task_id):
+    if not isinstance(value, str):
+        raise ValueError(f"benchmark task {task_id} fixture_repo must be a string")
+    raw = value.strip()
+    if not raw:
+        raise ValueError(f"benchmark task {task_id} fixture_repo must not be empty")
+    candidate = Path(raw)
+    if candidate.is_absolute() or PureWindowsPath(raw).is_absolute():
+        raise ValueError(f"benchmark task {task_id} fixture_repo must be relative")
+    resolved = (repo_root / candidate).resolve()
+    try:
+        relative = resolved.relative_to(repo_root)
+    except ValueError as exc:
+        raise ValueError(f"benchmark task {task_id} fixture_repo escapes repository root") from exc
+    if not resolved.is_dir():
+        raise ValueError(f"benchmark task {task_id} fixture repo does not exist: {raw}")
+    if not relative.parts:
+        raise ValueError(f"benchmark task {task_id} fixture_repo must name a repository subdirectory")
+    return relative.as_posix(), resolved
+
+
+def _normalized_setup(value, fixture_repo, task_id):
+    if not isinstance(value, dict):
+        raise ValueError(f"benchmark task {task_id} setup must be a mapping")
+    setup = dict(value)
+    setup_kind = str(setup.get("kind", "")).strip()
+    if setup_kind not in {"context_reduction", "freshness_mismatch", "workspace_mismatch"}:
+        raise ValueError(f"benchmark task {task_id} has an unknown setup kind: {setup_kind}")
+    setup["kind"] = setup_kind
+    if setup_kind == "freshness_mismatch":
+        setup["path"] = _normalized_relative_path(
+            setup.get("path", "sample.txt"),
+            fixture_repo,
+            task_id,
+            "setup.path",
+        )
+    return setup
 
 
 def _fixture_snapshot_id(fixture_paths):
@@ -189,16 +327,43 @@ def validate_benchmark(data, repo_root=None):
                 f"benchmark task {task.get('id', index)!r} is missing required keys: {', '.join(missing_task_keys)}"
             )
 
-        task_id = str(task["id"]).strip()
-        if not task_id:
-            raise ValueError(f"benchmark task at index {index} has an empty id")
-        if task_id in seen_ids:
+        task_id = _normalized_task_id(task["id"])
+        task_id_key = task_id.casefold()
+        if task_id_key in seen_ids:
             raise ValueError(f"duplicate benchmark task id: {task_id}")
-        seen_ids.add(task_id)
+        seen_ids.add(task_id_key)
 
-        fixture_repo = repo_root / str(task["fixture_repo"])
-        if not fixture_repo.is_dir():
-            raise ValueError(f"benchmark task {task_id} fixture repo does not exist: {task['fixture_repo']}")
+        fixture_repo_value, fixture_repo = _normalized_fixture_repo(
+            task["fixture_repo"],
+            repo_root,
+            task_id,
+        )
+
+        normalized_text = {}
+        for field in ("prompt", "expected_artifact", "category"):
+            value = task[field]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"benchmark task {task_id} {field} must be a non-empty string")
+            normalized_text[field] = value.strip()
+
+        has_verifier = "verifier" in task
+        has_verifier_argv = "verifier_argv" in task
+        if has_verifier == has_verifier_argv:
+            raise ValueError(
+                f"benchmark task {task_id} must provide exactly one of verifier or verifier_argv"
+            )
+        if has_verifier and (
+            not isinstance(task["verifier"], str) or not task["verifier"].strip()
+        ):
+            raise ValueError(f"benchmark task {task_id} verifier must be a non-empty string")
+        if has_verifier_argv:
+            verifier_argv = task["verifier_argv"]
+            if not isinstance(verifier_argv, list) or not verifier_argv:
+                raise ValueError(f"benchmark task {task_id} verifier_argv must be a non-empty list")
+            if any(not isinstance(item, str) or not item for item in verifier_argv):
+                raise ValueError(
+                    f"benchmark task {task_id} verifier_argv must contain non-empty strings"
+                )
 
         allowed_tools = task["allowed_tools"]
         if not isinstance(allowed_tools, list) or not allowed_tools:
@@ -213,19 +378,75 @@ def validate_benchmark(data, repo_root=None):
                 raise ValueError(f"benchmark task {task_id} has an unknown allowed_tools entry: {tool_name}")
             normalized_allowed_tools.append(tool_name)
 
-        step_budget = int(task["step_budget"])
+        raw_step_budget = task["step_budget"]
+        if isinstance(raw_step_budget, bool) or not isinstance(raw_step_budget, int):
+            raise ValueError(f"benchmark task {task_id} step_budget must be an integer")
+        step_budget = raw_step_budget
         if step_budget < 1:
             raise ValueError(f"benchmark task {task_id} step_budget must be positive")
 
+        requires_research = task.get("requires_research", True)
+        if not isinstance(requires_research, bool):
+            raise ValueError(f"benchmark task {task_id} requires_research must be a boolean")
+
+        backends = task.get("backends", ["native"])
+        if not isinstance(backends, list) or not backends:
+            raise ValueError(f"benchmark task {task_id} backends must be a non-empty list")
+        normalized_backends = []
+        for backend in backends:
+            backend_name = str(backend).strip()
+            if backend_name not in {"native", "langgraph"}:
+                raise ValueError(f"benchmark task {task_id} has an unknown backend: {backend_name}")
+            if backend_name not in normalized_backends:
+                normalized_backends.append(backend_name)
+
+        focus_paths = task.get("focus_paths", [])
+        if not isinstance(focus_paths, list):
+            raise ValueError(f"benchmark task {task_id} focus_paths must be a list")
+        normalized_focus_paths = [
+            _normalized_relative_path(path, fixture_repo, task_id, "focus_paths")
+            for path in focus_paths
+        ]
+        artifact_path = None
+        if "artifact_path" in task:
+            artifact_path = _normalized_relative_path(
+                task["artifact_path"], fixture_repo, task_id, "artifact_path"
+            )
+
         normalized_task = dict(task)
         normalized_task["id"] = task_id
-        normalized_task["prompt"] = str(task["prompt"]).strip()
-        normalized_task["fixture_repo"] = str(task["fixture_repo"]).strip()
+        normalized_task["prompt"] = normalized_text["prompt"]
+        normalized_task["fixture_repo"] = fixture_repo_value
         normalized_task["allowed_tools"] = normalized_allowed_tools
         normalized_task["step_budget"] = step_budget
-        normalized_task["expected_artifact"] = str(task["expected_artifact"]).strip()
-        normalized_task["verifier"] = str(task["verifier"]).strip()
-        normalized_task["category"] = str(task["category"]).strip()
+        normalized_task["expected_artifact"] = normalized_text["expected_artifact"]
+        normalized_task["category"] = normalized_text["category"]
+        acceptance = task.get("acceptance", normalized_task["prompt"])
+        if not isinstance(acceptance, str) or not acceptance.strip():
+            raise ValueError(f"benchmark task {task_id} acceptance must be a non-empty string")
+        normalized_task["acceptance"] = acceptance.strip()
+        normalized_task["requires_research"] = requires_research
+        normalized_task["focus_paths"] = normalized_focus_paths
+        normalized_task["backends"] = normalized_backends
+        if "setup" in task:
+            normalized_task["setup"] = _normalized_setup(
+                task["setup"],
+                fixture_repo,
+                task_id,
+            )
+        if has_verifier:
+            normalized_task["verifier"] = str(task["verifier"]).strip()
+            normalized_task.pop("verifier_argv", None)
+        else:
+            normalized_task["verifier_argv"] = [str(item) for item in task["verifier_argv"]]
+            normalized_task.pop("verifier", None)
+        if artifact_path is not None:
+            normalized_task["artifact_path"] = artifact_path
+        if "verifier_timeout_s" in task:
+            verifier_timeout_s = task["verifier_timeout_s"]
+            if isinstance(verifier_timeout_s, bool) or not isinstance(verifier_timeout_s, int):
+                raise ValueError(f"benchmark task {task_id} verifier_timeout_s must be an integer")
+            normalized_task["verifier_timeout_s"] = verifier_timeout_s
         normalized_tasks.append(normalized_task)
 
     normalized = dict(data)
@@ -244,27 +465,32 @@ def load_benchmark(path=DEFAULT_BENCHMARK_PATH, repo_root=None):
 
 def summarize_rows(rows):
     rows = list(rows)
-    passed = sum(1 for row in rows if row.get("passed") or row.get("status") == "pass")
-    failed = len(rows) - passed
+    eligible_rows = [row for row in rows if row.get("status") != "skipped"]
+    skipped_rows = [row for row in rows if row.get("status") == "skipped"]
+    passed = sum(1 for row in eligible_rows if row.get("passed") or row.get("status") == "pass")
+    failed = len(eligible_rows) - passed
     failure_category_counts = {}
-    for row in rows:
+    for row in eligible_rows:
         if row.get("passed") or row.get("status") == "pass":
             continue
         category = str(row.get("failure_category") or "unknown")
         failure_category_counts[category] = failure_category_counts.get(category, 0) + 1
 
     total_tasks = len(rows)
-    within_budget = sum(1 for row in rows if row.get("within_budget"))
-    verifier_passes = sum(1 for row in rows if row.get("verifier_passed"))
+    eligible_tasks = len(eligible_rows)
+    within_budget = sum(1 for row in eligible_rows if row.get("within_budget"))
+    verifier_passes = sum(1 for row in eligible_rows if row.get("verifier_passed"))
     return {
         "total_tasks": total_tasks,
+        "eligible_tasks": eligible_tasks,
+        "skipped_tasks": len(skipped_rows),
         "passed": passed,
         "failed": failed,
-        "pass_rate": (passed / total_tasks) if total_tasks else 0.0,
+        "pass_rate": (passed / eligible_tasks) if eligible_tasks else 0.0,
         "within_budget": within_budget,
         "verifier_passes": verifier_passes,
-        "within_budget_rate": (within_budget / total_tasks) if total_tasks else 0.0,
-        "verifier_pass_rate": (verifier_passes / total_tasks) if total_tasks else 0.0,
+        "within_budget_rate": (within_budget / eligible_tasks) if eligible_tasks else 0.0,
+        "verifier_pass_rate": (verifier_passes / eligible_tasks) if eligible_tasks else 0.0,
         "failure_category_counts": failure_category_counts,
     }
 
@@ -373,6 +599,37 @@ def _apply_task_setup(agent, task, fixture_copy_root):
         return
 
 
+def _event_metrics(events):
+    events = list(events or [])
+    delegate_started = [event for event in events if event.get("event") == "delegate_started"]
+    review_requested = [event for event in events if event.get("event") == "review_requested"]
+    completed_reviews = [
+        event for event in events if event.get("event") in {"review_passed", "review_failed"}
+    ]
+    review_passed = None
+    if completed_reviews:
+        review_passed = completed_reviews[-1].get("event") == "review_passed"
+    return {
+        "delegate_calls": len(delegate_started) + len(review_requested),
+        "delegate_failures": sum(event.get("event") == "delegate_failed" for event in events),
+        "research_calls": sum(event.get("agent_role") == "research" for event in delegate_started),
+        "review_calls": len(review_requested),
+        "review_passed": review_passed,
+        "review_retries": sum(event.get("event") == "review_retry_started" for event in events),
+    }
+
+
+def _aggregate_states(task_state, child_task_states):
+    states = [task_state, *list(child_task_states or [])]
+    return {
+        "tool_steps": sum(state.tool_steps for state in states),
+        "attempts": sum(state.attempts for state in states),
+        "sandbox_violations": sum(state.sandbox_violations for state in states),
+        "malformed_output_recovered": sum(state.malformed_output_recovered for state in states),
+        "affected_paths": sorted({path for state in states for path in state.affected_paths}),
+    }
+
+
 class BenchmarkEvaluator:
     def __init__(
         self,
@@ -386,6 +643,10 @@ class BenchmarkEvaluator:
         max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
         timezone_name=DEFAULT_TIMEZONE,
         model_client_factory=None,
+        backend="native",
+        event_sink_factory=None,
+        backend_runner=None,
+        verifier_runner=None,
     ):
         self.benchmark_path = Path(benchmark_path)
         self.artifact_path = Path(artifact_path)
@@ -399,6 +660,12 @@ class BenchmarkEvaluator:
         self.max_new_tokens = max_new_tokens
         self.timezone_name = timezone_name
         self.model_client_factory = model_client_factory
+        self.backend = str(backend)
+        if self.backend not in {"native", "langgraph"}:
+            raise ValueError(f"unknown backend: {self.backend}")
+        self.event_sink_factory = event_sink_factory
+        self.backend_runner = backend_runner
+        self.verifier_runner = verifier_runner or VerifierRunner()
         self.repo_root = self.benchmark_path.resolve().parent.parent
 
     def load(self):
@@ -406,19 +673,26 @@ class BenchmarkEvaluator:
 
     def run(self):
         benchmark = self.load()
-        rows = [self.run_task(task) for task in benchmark["tasks"]]
+        rows = []
+        for task in benchmark["tasks"]:
+            try:
+                rows.append(self.run_task(task))
+            except Exception as exc:
+                rows.append(self._harness_failure_row(task, type(exc).__name__))
         summary = summarize_rows(rows)
         artifact = {
-            "schema_version": BENCHMARK_SCHEMA_VERSION,
+            "schema_version": EVALUATION_ARTIFACT_SCHEMA_VERSION,
             "captured_at": _now_in_timezone(self.timezone_name),
             "runtime": {
                 "commit_sha": _git_value(["rev-parse", "HEAD"], cwd=self.repo_root),
                 "branch": _git_value(["branch", "--show-current"], cwd=self.repo_root),
             },
             "benchmark": {
+                "schema_version": benchmark["schema_version"],
                 "source": str(self.benchmark_path.resolve().relative_to(self.repo_root)),
                 "task_count": len(benchmark["tasks"]),
             },
+            "backend": self.backend,
             "reproducibility": {
                 "fixture_snapshot_id": _fixture_snapshot_id(
                     self.repo_root / str(task["fixture_repo"]) for task in benchmark["tasks"]
@@ -442,8 +716,29 @@ class BenchmarkEvaluator:
 
     def run_task(self, task):
         task = dict(task)
-        fixture_source = self.repo_root / task["fixture_repo"]
+        if self.backend not in task.get("backends", ["native"]):
+            return self._skipped_row(task)
+
+        started_at = time.monotonic()
+        task["id"] = _normalized_task_id(task["id"])
+        task["fixture_repo"], fixture_source = _normalized_fixture_repo(
+            task["fixture_repo"],
+            self.repo_root,
+            task["id"],
+        )
+        if "setup" in task:
+            task["setup"] = _normalized_setup(
+                task["setup"],
+                fixture_source,
+                task["id"],
+            )
         fixture_copy_root = self.workspace_root / task["id"] / fixture_source.name
+        try:
+            fixture_copy_root.resolve().relative_to(fixture_source)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("benchmark workspace_root must not be inside fixture_repo")
         if fixture_copy_root.exists():
             shutil.rmtree(fixture_copy_root)
         fixture_copy_root.parent.mkdir(parents=True, exist_ok=True)
@@ -458,58 +753,61 @@ class BenchmarkEvaluator:
         if self.model_client_factory is not None:
             model_client = self.model_client_factory(task=task, workspace=workspace)
         else:
-            model_client = FakeModelClient(_scripted_outputs_for_task(task))
-        agent = Pico(
-            model_client=model_client,
-            workspace=workspace,
-            session_store=session_store,
-            run_store=run_store,
-            approval_policy="auto",
-            max_steps=int(task["step_budget"]),
+            model_client = FakeModelClient(_scripted_outputs_for_task(task, self.backend))
+        runner = self.backend_runner or build_backend_runner(
+            self.backend,
             max_new_tokens=self.max_new_tokens,
-            allowed_tools=task["allowed_tools"],
+            event_sink_factory=self.event_sink_factory,
         )
-        _apply_task_setup(agent, task, fixture_copy_root)
-
-        initial_history_empty = len(agent.session["history"]) == 0
-        initial_memory_state = agent.memory.to_dict()
-        initial_memory_empty = memorylib.is_effectively_empty(initial_memory_state)
-        initial_task_summary_empty = not str(initial_memory_state["working"]["task_summary"]).strip()
-        initial_episodic_notes_empty = not initial_memory_state["episodic_notes"]
-
-        final_answer = agent.ask(task["prompt"])
-        task_state = agent.current_task_state
+        backend_result = runner.run_task(
+            task,
+            workspace,
+            session_store,
+            run_store,
+            fixture_copy_root,
+            model_client=model_client,
+        )
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        agent = backend_result.agent
+        task_state = backend_result.task_state
         run_dir = Path(agent.current_run_dir)
         task_state_path = agent.run_store.task_state_path(task_state)
         report_path = agent.run_store.report_path(task_state)
-        report = agent.run_store.load_report(task_state.run_id)
+        try:
+            report = agent.run_store.load_report(task_state.run_id)
+        except Exception:
+            report = {}
 
         artifact_path = _artifact_path_for_task(task)
         artifact_file = fixture_copy_root / artifact_path
-        expected_artifact_exists = artifact_file.exists()
+        expected_artifact_exists = artifact_file.is_file()
         artifact_digest = _digest_file(artifact_file) if expected_artifact_exists else ""
 
-        verifier = subprocess.run(
-            task["verifier"],
-            cwd=fixture_copy_root,
-            shell=True,
-            capture_output=True,
-            text=True,
-        )
+        verifier = self.verifier_runner.run(task, fixture_copy_root)
 
-        within_budget = task_state.tool_steps <= int(task["step_budget"])
-        verifier_passed = verifier.returncode == 0
+        coordinator_tool_steps = sum(state.tool_steps for state in backend_result.budget_task_states)
+        within_budget = coordinator_tool_steps <= int(task["step_budget"])
+        verifier_passed = verifier.passed
         non_failure_stop_reason = task_state.stop_reason == STOP_REASON_FINAL_ANSWER_RETURNED
         passed = within_budget and verifier_passed and expected_artifact_exists and non_failure_stop_reason
         failure_category = None if passed else self._failure_category(
+            stop_reason=task_state.stop_reason,
             within_budget=within_budget,
             verifier_passed=verifier_passed,
+            verifier_failure_category=verifier.failure_category,
             expected_artifact_exists=expected_artifact_exists,
             non_failure_stop_reason=non_failure_stop_reason,
         )
 
-        return {
+        aggregate = _aggregate_states(task_state, backend_result.child_task_states)
+        events = list(backend_result.events)
+        event_metrics = _event_metrics(events)
+        initial_state = backend_result.initial_state
+        run_metadata = dict(backend_result.run_metadata or {})
+
+        row = {
             "id": task["id"],
+            "backend": self.backend,
             "prompt": task["prompt"],
             "fixture_repo": task["fixture_repo"],
             "fixture_copy_relpath": _workspace_relative(fixture_copy_root, self.workspace_root),
@@ -523,8 +821,9 @@ class BenchmarkEvaluator:
             "artifact_path": artifact_path,
             "artifact_exists": expected_artifact_exists,
             "artifact_digest": artifact_digest,
-            "verifier": task["verifier"],
-            "verifier_exit_code": verifier.returncode,
+            "verifier": task.get("verifier"),
+            "verifier_argv": list(verifier.argv),
+            "verifier_exit_code": verifier.exit_code,
             "verifier_stdout": verifier.stdout,
             "verifier_stderr": verifier.stderr,
             "category": task["category"],
@@ -535,34 +834,128 @@ class BenchmarkEvaluator:
             "verifier_passed": verifier_passed,
             "expected_artifact_exists": expected_artifact_exists,
             "non_failure_stop_reason": non_failure_stop_reason,
-            "tool_steps": task_state.tool_steps,
-            "attempts": task_state.attempts,
-            "final_answer": final_answer,
+            "tool_steps": aggregate["tool_steps"],
+            "attempts": aggregate["attempts"],
+            "sandbox_violations": aggregate["sandbox_violations"],
+            "malformed_output_recovered": aggregate["malformed_output_recovered"],
+            "affected_paths": aggregate["affected_paths"],
+            "duration_ms": duration_ms,
+            "final_answer": backend_result.final_answer,
             "stop_reason": task_state.stop_reason,
-            "initial_history_empty": initial_history_empty,
-            "initial_memory_empty": initial_memory_empty,
-            "initial_task_summary_empty": initial_task_summary_empty,
-            "initial_episodic_notes_empty": initial_episodic_notes_empty,
+            "initial_history_empty": initial_state.get("initial_history_empty"),
+            "initial_memory_empty": initial_state.get("initial_memory_empty"),
+            "initial_task_summary_empty": initial_state.get("initial_task_summary_empty"),
+            "initial_episodic_notes_empty": initial_state.get("initial_episodic_notes_empty"),
+            "requested_task_mode": run_metadata.get("requested_task_mode", ""),
+            "resolved_intent": run_metadata.get("resolved_intent", ""),
+            "intent_source": run_metadata.get("intent_source", ""),
+            "intent_attempts": int(run_metadata.get("intent_attempts", 0)),
+            "answer_attempts": int(run_metadata.get("answer_attempts", 0)),
+            "execution_started": True,
             "task_state": task_state.to_dict(),
+            "child_task_states": [state.to_dict() for state in backend_result.child_task_states],
+            "budget_task_states": [state.to_dict() for state in backend_result.budget_task_states],
+            "events": events,
             "report": report,
         }
+        row.update(event_metrics)
+        return row
 
     def _failure_category(
         self,
+        stop_reason,
         within_budget,
         verifier_passed,
+        verifier_failure_category,
         expected_artifact_exists,
         non_failure_stop_reason,
     ):
+        if stop_reason in {"model_error", "runtime_error", "persistence_error", "delegate_failed"}:
+            return stop_reason
+        if stop_reason in {
+            "budget_exhausted",
+            "no_changes_to_review",
+            "review_retry_limit_reached",
+        }:
+            return stop_reason
         if not expected_artifact_exists:
             return "missing_artifact"
         if not within_budget:
             return "budget_exceeded"
         if not verifier_passed:
-            return "verifier_failed"
+            return verifier_failure_category or "verifier_failed"
         if not non_failure_stop_reason:
             return "failure_stop_reason"
         return "unknown"
+
+    def _empty_row(self, task, *, status, failure_category):
+        return {
+            "id": task["id"],
+            "backend": self.backend,
+            "prompt": task["prompt"],
+            "fixture_repo": task["fixture_repo"],
+            "fixture_copy_relpath": "",
+            "run_id": "",
+            "run_dir_relpath": "",
+            "task_state_relpath": "",
+            "report_relpath": "",
+            "allowed_tools": list(task["allowed_tools"]),
+            "step_budget": int(task["step_budget"]),
+            "expected_artifact": task["expected_artifact"],
+            "artifact_path": str(task.get("artifact_path", "")),
+            "artifact_exists": None,
+            "artifact_digest": "",
+            "verifier": task.get("verifier"),
+            "verifier_argv": list(task.get("verifier_argv", [])),
+            "verifier_exit_code": None,
+            "verifier_stdout": "",
+            "verifier_stderr": "",
+            "category": task["category"],
+            "status": status,
+            "passed": None if status == "skipped" else False,
+            "failure_category": failure_category,
+            "within_budget": None,
+            "verifier_passed": None,
+            "expected_artifact_exists": None,
+            "non_failure_stop_reason": None,
+            "tool_steps": 0,
+            "attempts": 0,
+            "sandbox_violations": 0,
+            "malformed_output_recovered": 0,
+            "affected_paths": [],
+            "duration_ms": 0,
+            "final_answer": "",
+            "stop_reason": "",
+            "initial_history_empty": None,
+            "initial_memory_empty": None,
+            "initial_task_summary_empty": None,
+            "initial_episodic_notes_empty": None,
+            "execution_started": False,
+            "task_state": {},
+            "child_task_states": [],
+            "budget_task_states": [],
+            "events": [],
+            "report": {},
+            "delegate_calls": 0,
+            "delegate_failures": 0,
+            "research_calls": 0,
+            "review_calls": 0,
+            "review_passed": None,
+            "review_retries": 0,
+            "requested_task_mode": "",
+            "resolved_intent": "",
+            "intent_source": "",
+            "intent_attempts": 0,
+            "answer_attempts": 0,
+        }
+
+    def _skipped_row(self, task):
+        return self._empty_row(task, status="skipped", failure_category="backend_not_applicable")
+
+    def _harness_failure_row(self, task, error_type):
+        row = self._empty_row(task, status="fail", failure_category="harness_error")
+        row["final_answer"] = f"harness setup failed: {error_type}"
+        return row
 
     def _write_artifact(self, artifact):
         self.artifact_path.parent.mkdir(parents=True, exist_ok=True)
@@ -584,6 +977,10 @@ def run_fixed_benchmark(
     max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
     timezone_name=DEFAULT_TIMEZONE,
     model_client_factory=None,
+    backend="native",
+    event_sink_factory=None,
+    backend_runner=None,
+    verifier_runner=None,
 ):
     evaluator = BenchmarkEvaluator(
         benchmark_path=benchmark_path,
@@ -596,6 +993,10 @@ def run_fixed_benchmark(
         max_new_tokens=max_new_tokens,
         timezone_name=timezone_name,
         model_client_factory=model_client_factory,
+        backend=backend,
+        event_sink_factory=event_sink_factory,
+        backend_runner=backend_runner,
+        verifier_runner=verifier_runner,
     )
     return evaluator.run()
 
@@ -611,6 +1012,8 @@ def run_harness_regression_v2(
     max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
     timezone_name=DEFAULT_TIMEZONE,
     model_client_factory=None,
+    backend="native",
+    event_sink_factory=None,
 ):
     return run_fixed_benchmark(
         benchmark_path=benchmark_path,
@@ -623,4 +1026,49 @@ def run_harness_regression_v2(
         max_new_tokens=max_new_tokens,
         timezone_name=timezone_name,
         model_client_factory=model_client_factory,
+        backend=backend,
+        event_sink_factory=event_sink_factory,
     )
+
+
+def normalize_evaluation_artifact(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("evaluation artifact must be a mapping")
+    version = int(payload.get("schema_version", 0))
+    if version not in {1, EVALUATION_ARTIFACT_SCHEMA_VERSION}:
+        raise ValueError(f"unsupported evaluation artifact schema_version: {version}")
+
+    normalized = dict(payload)
+    upgraded_from_v1 = version == 1
+    if upgraded_from_v1:
+        normalized["schema_version"] = EVALUATION_ARTIFACT_SCHEMA_VERSION
+        normalized.setdefault("backend", "native")
+        benchmark = dict(normalized.get("benchmark", {}))
+        benchmark.setdefault("schema_version", BENCHMARK_SCHEMA_VERSION)
+        normalized["benchmark"] = benchmark
+
+    rows = [dict(row) for row in normalized.get("rows", [])]
+    for row in rows:
+        row.setdefault("backend", "native")
+        row.setdefault("execution_started", bool(row.get("run_id")))
+        row.setdefault("events", [])
+        row.setdefault("child_task_states", [])
+        row.setdefault("budget_task_states", [row.get("task_state", {})] if row.get("task_state") else [])
+        row.setdefault("requested_task_mode", "")
+        row.setdefault("resolved_intent", "")
+        row.setdefault("intent_source", "")
+        row.setdefault("intent_attempts", 0)
+        row.setdefault("answer_attempts", 0)
+    normalized["rows"] = rows
+    if upgraded_from_v1 or "summary" not in normalized:
+        normalized["summary"] = summarize_rows(rows)
+    normalized.setdefault(
+        "failure_category_counts",
+        normalized["summary"]["failure_category_counts"],
+    )
+    return normalized
+
+
+def load_evaluation_artifact(path):
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    return normalize_evaluation_artifact(payload)

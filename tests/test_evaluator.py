@@ -6,11 +6,15 @@ import pytest
 
 from pico.evaluation.evaluator import (
     BenchmarkEvaluator,
+    _now_in_timezone,
     load_benchmark,
+    normalize_evaluation_artifact,
     run_harness_regression_v2,
     run_fixed_benchmark,
     summarize_rows,
+    validate_benchmark,
 )
+from zoneinfo import ZoneInfoNotFoundError
 
 
 def test_load_benchmark_validates_fixed_schema():
@@ -29,6 +33,17 @@ def test_load_benchmark_validates_fixed_schema():
         assert {"id", "prompt", "fixture_repo", "allowed_tools", "step_budget", "expected_artifact", "verifier", "category"} <= set(task)
         assert isinstance(task["allowed_tools"], list)
         assert task["step_budget"] > 0
+
+
+def test_default_timezone_falls_back_without_external_tzdata(monkeypatch):
+    def missing_timezone(_):
+        raise ZoneInfoNotFoundError("missing tzdata")
+
+    monkeypatch.setattr("pico.evaluation.evaluator.ZoneInfo", missing_timezone)
+
+    captured_at = _now_in_timezone("Asia/Shanghai")
+
+    assert captured_at.endswith("+0800")
 
 
 def test_load_benchmark_rejects_missing_required_task_fields(tmp_path):
@@ -50,6 +65,83 @@ def test_load_benchmark_rejects_missing_required_task_fields(tmp_path):
 
     with pytest.raises(ValueError, match="required"):
         load_benchmark(benchmark_path)
+
+
+def test_load_delegate_benchmark_normalizes_extension_fields():
+    benchmark = load_benchmark(Path("benchmarks/delegate_tasks.json"))
+
+    assert len(benchmark["tasks"]) == 4
+    assert benchmark["tasks"][0]["backends"] == ["langgraph"]
+    assert benchmark["tasks"][0]["requires_research"] is True
+    assert benchmark["tasks"][0]["artifact_path"] == "README.md"
+    assert "verifier_argv" in benchmark["tasks"][0]
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"verifier": "python -V"}, "exactly one"),
+        ({"verifier_argv": ["python", 1]}, "must contain non-empty strings"),
+        ({"verifier_timeout_s": True}, "verifier_timeout_s must be an integer"),
+        ({"id": None}, "task id must be a string"),
+        ({"id": "../outside"}, "filesystem-safe slug"),
+        ({"id": "CON"}, "filesystem-safe slug"),
+        ({"fixture_repo": "."}, "must name a repository subdirectory"),
+        ({"fixture_repo": "../outside"}, "escapes repository root"),
+        ({"prompt": ""}, "prompt must be a non-empty string"),
+        ({"step_budget": "2"}, "step_budget must be an integer"),
+        ({"acceptance": ""}, "acceptance must be a non-empty string"),
+        ({"requires_research": "true"}, "must be a boolean"),
+        ({"backends": ["unknown"]}, "unknown backend"),
+        ({"artifact_path": "../outside.txt"}, "escapes fixture root"),
+        ({"artifact_path": "C:\\outside.txt"}, "must be relative"),
+        (
+            {"setup": {"kind": "freshness_mismatch", "path": "../outside.txt"}},
+            "setup.path escapes fixture root",
+        ),
+        ({"setup": {"kind": "unknown"}}, "unknown setup kind"),
+    ],
+)
+def test_benchmark_extension_validation_rejects_invalid_contracts(tmp_path, updates, message):
+    fixture = tmp_path / "fixture"
+    fixture.mkdir()
+    (fixture / "README.md").write_text("demo\n", encoding="utf-8")
+    task = {
+        "id": "contract",
+        "prompt": "Inspect README.",
+        "fixture_repo": "fixture",
+        "allowed_tools": ["read_file"],
+        "step_budget": 2,
+        "expected_artifact": "README exists",
+        "verifier_argv": ["python", "-V"],
+        "category": "contract",
+    }
+    task.update(updates)
+
+    with pytest.raises(ValueError, match=message):
+        validate_benchmark({"schema_version": 1, "tasks": [task]}, repo_root=tmp_path)
+
+
+def test_benchmark_rejects_case_colliding_task_ids(tmp_path):
+    fixture = tmp_path / "fixture"
+    fixture.mkdir()
+    task = {
+        "id": "CaseTask",
+        "prompt": "Inspect README.",
+        "fixture_repo": "fixture",
+        "allowed_tools": ["read_file"],
+        "step_budget": 2,
+        "expected_artifact": "README exists",
+        "verifier_argv": ["python", "-V"],
+        "category": "contract",
+    }
+    duplicate = {**task, "id": "casetask"}
+
+    with pytest.raises(ValueError, match="duplicate benchmark task id"):
+        validate_benchmark(
+            {"schema_version": 1, "tasks": [task, duplicate]},
+            repo_root=tmp_path,
+        )
 
 
 def test_run_fixed_benchmark_uses_fresh_fixture_copy_and_fresh_run_directory(tmp_path):
@@ -79,6 +171,76 @@ def test_run_fixed_benchmark_uses_fresh_fixture_copy_and_fresh_run_directory(tmp
     assert "beta-locked" in (copied_fixture / "sample.txt").read_text(encoding="utf-8")
 
 
+def test_run_task_revalidates_task_id_before_removing_workspace(tmp_path):
+    evaluator = BenchmarkEvaluator(
+        benchmark_path=Path("benchmarks/coding_tasks.json"),
+        artifact_path=tmp_path / "artifact.json",
+        workspace_root=tmp_path / "workspaces",
+    )
+    task = dict(evaluator.load()["tasks"][0])
+    task["id"] = "../outside"
+
+    with pytest.raises(ValueError, match="filesystem-safe slug"):
+        evaluator.run_task(task)
+
+    assert not (tmp_path / "outside").exists()
+
+
+def test_run_task_revalidates_setup_path_before_writing_fixture(tmp_path):
+    evaluator = BenchmarkEvaluator(
+        benchmark_path=Path("benchmarks/coding_tasks.json"),
+        artifact_path=tmp_path / "artifact.json",
+        workspace_root=tmp_path / "workspaces",
+    )
+    task = dict(evaluator.load()["tasks"][0])
+    task["setup"] = {"kind": "freshness_mismatch", "path": "../outside.txt"}
+
+    with pytest.raises(ValueError, match="setup.path escapes fixture root"):
+        evaluator.run_task(task)
+
+    assert not (tmp_path / "outside.txt").exists()
+
+
+def test_run_task_rejects_workspace_nested_inside_fixture(tmp_path):
+    repo_root = tmp_path / "repo"
+    fixture = repo_root / "fixture"
+    benchmark_path = repo_root / "benchmarks" / "tasks.json"
+    fixture.mkdir(parents=True)
+    benchmark_path.parent.mkdir()
+    (fixture / "README.md").write_text("demo\n", encoding="utf-8")
+    benchmark_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "tasks": [
+                    {
+                        "id": "nested-workspace",
+                        "prompt": "Inspect README.",
+                        "fixture_repo": "fixture",
+                        "allowed_tools": ["read_file"],
+                        "step_budget": 2,
+                        "expected_artifact": "README exists",
+                        "verifier_argv": ["python", "-V"],
+                        "category": "contract",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    workspace_root = fixture / "generated"
+    evaluator = BenchmarkEvaluator(
+        benchmark_path=benchmark_path,
+        artifact_path=tmp_path / "artifact.json",
+        workspace_root=workspace_root,
+    )
+
+    with pytest.raises(ValueError, match="workspace_root must not be inside fixture_repo"):
+        evaluator.run_task(evaluator.load()["tasks"][0])
+
+    assert not workspace_root.exists()
+
+
 def test_run_fixed_benchmark_reports_metadata_and_success_definition(tmp_path):
     artifact_path = tmp_path / "benchmark-v1.json"
     artifact = run_fixed_benchmark(
@@ -91,9 +253,13 @@ def test_run_fixed_benchmark_reports_metadata_and_success_definition(tmp_path):
     persisted = json.loads(artifact_path.read_text(encoding="utf-8"))
     assert persisted == artifact
 
-    assert artifact["schema_version"] == 1
+    assert artifact["schema_version"] == 2
+    assert artifact["benchmark"]["schema_version"] == 1
+    assert artifact["backend"] == "native"
     assert artifact["summary"] == {
         "total_tasks": 12,
+        "eligible_tasks": 12,
+        "skipped_tasks": 0,
         "passed": 12,
         "failed": 0,
         "pass_rate": 1.0,
@@ -115,7 +281,7 @@ def test_run_fixed_benchmark_reports_metadata_and_success_definition(tmp_path):
         "max_new_tokens": 64,
     }
     assert reproducibility["timezone"] == "Asia/Shanghai"
-    assert reproducibility["locale"] == "C.UTF-8"
+    assert reproducibility["locale"]
 
     for row in artifact["rows"]:
         assert not row["fixture_copy_relpath"].startswith("/")
@@ -216,6 +382,8 @@ def test_summarize_rows_counts_failure_categories():
     )
 
     assert summary["total_tasks"] == 3
+    assert summary["eligible_tasks"] == 3
+    assert summary["skipped_tasks"] == 0
     assert summary["passed"] == 1
     assert summary["failed"] == 2
     assert summary["pass_rate"] == pytest.approx(1 / 3)
@@ -225,3 +393,160 @@ def test_summarize_rows_counts_failure_categories():
         "budget_exceeded": 1,
         "verifier_failed": 1,
     }
+
+
+def test_summarize_rows_excludes_skipped_from_denominators():
+    summary = summarize_rows(
+        [
+            {"status": "pass", "passed": True, "within_budget": True, "verifier_passed": True},
+            {
+                "status": "skipped",
+                "passed": None,
+                "within_budget": None,
+                "verifier_passed": None,
+                "failure_category": "backend_not_applicable",
+            },
+        ]
+    )
+
+    assert summary["total_tasks"] == 2
+    assert summary["eligible_tasks"] == 1
+    assert summary["skipped_tasks"] == 1
+    assert summary["pass_rate"] == 1.0
+    assert summary["failure_category_counts"] == {}
+
+
+def test_v1_evaluation_artifact_is_normalized_for_readers():
+    normalized = normalize_evaluation_artifact(
+        {
+            "schema_version": 1,
+            "benchmark": {"source": "benchmarks/coding_tasks.json", "task_count": 1},
+            "rows": [{"id": "legacy", "status": "pass", "passed": True}],
+        }
+    )
+
+    assert normalized["schema_version"] == 2
+    assert normalized["backend"] == "native"
+    assert normalized["benchmark"]["schema_version"] == 1
+    assert normalized["rows"][0]["events"] == []
+    assert normalized["rows"][0]["requested_task_mode"] == ""
+    assert normalized["rows"][0]["resolved_intent"] == ""
+    assert normalized["rows"][0]["intent_source"] == ""
+    assert normalized["rows"][0]["intent_attempts"] == 0
+    assert normalized["rows"][0]["answer_attempts"] == 0
+
+
+def test_old_v2_artifact_gets_route_defaults_without_recomputing_summary():
+    original_summary = {"sentinel": "preserved", "failure_category_counts": {}}
+    normalized = normalize_evaluation_artifact(
+        {
+            "schema_version": 2,
+            "backend": "native",
+            "benchmark": {"schema_version": 1},
+            "rows": [{"id": "old-v2", "status": "pass"}],
+            "summary": original_summary,
+            "failure_category_counts": {},
+        }
+    )
+
+    assert normalized["summary"] is original_summary
+    assert normalized["rows"][0]["requested_task_mode"] == ""
+    assert normalized["rows"][0]["resolved_intent"] == ""
+    assert normalized["rows"][0]["intent_source"] == ""
+    assert normalized["rows"][0]["intent_attempts"] == 0
+    assert normalized["rows"][0]["answer_attempts"] == 0
+
+
+def test_normal_skipped_and_harness_rows_share_route_metadata_fields(tmp_path):
+    evaluator = BenchmarkEvaluator(
+        benchmark_path=Path("benchmarks/coding_tasks.json"),
+        artifact_path=tmp_path / "artifact.json",
+        workspace_root=tmp_path / "workspaces",
+    )
+    task = evaluator.load()["tasks"][0]
+    normal = evaluator.run_task(task)
+    skipped = evaluator._skipped_row(task)
+    harness = evaluator._harness_failure_row(task, "RuntimeError")
+    route_keys = {
+        "requested_task_mode",
+        "resolved_intent",
+        "intent_source",
+        "intent_attempts",
+        "answer_attempts",
+    }
+
+    assert route_keys <= normal.keys()
+    assert normal["requested_task_mode"] == ""
+    assert route_keys <= skipped.keys()
+    assert route_keys <= harness.keys()
+
+
+def test_backend_not_applicable_returns_uniform_skipped_row(tmp_path):
+    evaluator = BenchmarkEvaluator(
+        benchmark_path=Path("benchmarks/coding_tasks.json"),
+        artifact_path=tmp_path / "artifact.json",
+        workspace_root=tmp_path / "workspaces",
+        backend="langgraph",
+    )
+
+    row = evaluator.run_task(evaluator.load()["tasks"][0])
+
+    assert row["status"] == "skipped"
+    assert row["failure_category"] == "backend_not_applicable"
+    assert row["within_budget"] is None
+    assert row["verifier_passed"] is None
+    assert row["execution_started"] is False
+    assert row["task_state"] == {}
+    assert row["events"] == []
+
+
+def test_task_setup_failure_does_not_abort_artifact(tmp_path):
+    class FailingFactory:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, task, workspace):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("provider details must not leak")
+            from pico.providers.clients import FakeModelClient
+
+            return FakeModelClient(["<final>Done.</final>"])
+
+    evaluator = BenchmarkEvaluator(
+        benchmark_path=Path("benchmarks/coding_tasks.json"),
+        artifact_path=tmp_path / "artifact.json",
+        workspace_root=tmp_path / "workspaces",
+        model_client_factory=FailingFactory(),
+    )
+    benchmark = evaluator.load()
+    benchmark["tasks"] = benchmark["tasks"][:2]
+    evaluator.load = lambda: benchmark
+
+    artifact = evaluator.run()
+
+    assert len(artifact["rows"]) == 2
+    assert artifact["rows"][0]["failure_category"] == "harness_error"
+    assert "provider details" not in artifact["rows"][0]["final_answer"]
+    assert artifact["rows"][1]["execution_started"] is True
+
+
+def test_native_model_failure_is_classified_and_finalized(tmp_path):
+    from pico.providers.clients import FakeModelClient
+
+    evaluator = BenchmarkEvaluator(
+        benchmark_path=Path("benchmarks/coding_tasks.json"),
+        artifact_path=tmp_path / "artifact.json",
+        workspace_root=tmp_path / "workspaces",
+        model_client_factory=lambda task, workspace: FakeModelClient([]),
+    )
+
+    row = evaluator.run_task(evaluator.load()["tasks"][0])
+
+    assert row["status"] == "fail"
+    assert row["failure_category"] == "model_error"
+    assert row["stop_reason"] == "model_error"
+    assert row["task_state"]["status"] == "failed"
+    assert row["report"]
+    assert any(event.get("event") == "run_finished" for event in row["events"])
+    assert "ran out of outputs" not in json.dumps(row)

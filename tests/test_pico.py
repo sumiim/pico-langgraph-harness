@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pico as pico_pkg
+from pico import cli as cli_module
 from pico import (
     AnthropicCompatibleModelClient,
     FakeModelClient,
@@ -158,6 +159,7 @@ def test_agent_retries_after_malformed_tool_payload(tmp_path):
     assert any(item["role"] == "tool" and item["name"] == "read_file" for item in agent.session["history"])
     notices = [item["content"] for item in agent.session["history"] if item["role"] == "assistant"]
     assert any("valid <tool> call" in item for item in notices)
+    assert agent.current_task_state.malformed_output_recovered == 1
 
 
 def test_agent_accepts_xml_write_file_tool(tmp_path):
@@ -173,6 +175,29 @@ def test_agent_accepts_xml_write_file_tool(tmp_path):
 
     assert answer == "Done."
     assert (tmp_path / "hello.py").read_text(encoding="utf-8") == 'print("hi")\n'
+    assert agent.current_task_state.affected_paths == ["hello.py"]
+
+
+def test_checkpoint_and_durable_memory_writes_can_be_disabled(tmp_path):
+    agent = build_agent(
+        tmp_path,
+        ["<final>Decision: Keep this only in the isolated child.</final>"],
+        allow_checkpoint=False,
+        allow_durable_memory_write=False,
+    )
+
+    answer = agent.ask("Remember this decision.")
+
+    assert answer == "Decision: Keep this only in the isolated child."
+    assert agent.current_task_state.checkpoint_id == ""
+    assert agent.session["checkpoints"]["items"] == {}
+    assert agent.last_durable_promotions == []
+    assert not (tmp_path / ".pico" / "memory").exists()
+    trace = [
+        json.loads(line)
+        for line in agent.run_store.trace_path(agent.current_task_state).read_text(encoding="utf-8").splitlines()
+    ]
+    assert not any(event["event"] == "checkpoint_created" for event in trace)
 
 
 def test_retries_do_not_consume_the_whole_budget(tmp_path):
@@ -252,6 +277,21 @@ def test_invalid_risky_tool_does_not_prompt_for_approval(tmp_path):
     assert result.startswith("error: invalid arguments for write_file: 'path'")
     assert 'example: <tool name="write_file"' in result
     mock_input.assert_not_called()
+
+
+def test_approval_prompt_displays_unicode_arguments_without_ascii_escapes(tmp_path):
+    agent = build_agent(tmp_path, [], approval_policy="ask")
+
+    with patch("builtins.input", return_value="y") as mock_input:
+        approved = agent.approve(
+            "patch_file",
+            {"path": "README.md", "new_text": "中文项目介绍"},
+        )
+
+    prompt = mock_input.call_args.args[0]
+    assert approved is True
+    assert "中文项目介绍" in prompt
+    assert "\\u4e2d" not in prompt
 
 
 def test_list_files_hides_internal_agent_state(tmp_path):
@@ -705,6 +745,31 @@ def test_build_arg_parser_defaults_provider_to_deepseek(tmp_path):
     assert args.provider == "deepseek"
 
 
+def test_build_model_client_applies_router_model_and_temperature_overrides(monkeypatch, tmp_path):
+    captured = []
+
+    def fake_client(**kwargs):
+        captured.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(cli_module, "OllamaModelClient", fake_client)
+    monkeypatch.setattr(cli_module, "OpenAICompatibleModelClient", fake_client)
+    monkeypatch.setattr(cli_module, "AnthropicCompatibleModelClient", fake_client)
+
+    for provider in ("ollama", "openai", "anthropic", "deepseek"):
+        args = pico_pkg.build_arg_parser().parse_args(
+            ["--cwd", str(tmp_path), "--provider", provider, "--temperature", "0.7"]
+        )
+        cli_module._build_model_client(
+            args,
+            model_override="router-model",
+            temperature_override=0.0,
+        )
+
+    assert [item["model"] for item in captured] == ["router-model"] * 4
+    assert [item["temperature"] for item in captured] == [0.0] * 4
+
+
 def test_build_arg_parser_accepts_anthropic_provider(tmp_path):
     args = pico_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--provider", "anthropic"])
 
@@ -916,13 +981,20 @@ def test_successful_run_persists_run_artifacts_and_stop_reason(tmp_path):
     assert "tool_executed" in trace_events
 
 
-def test_trace_and_report_redact_secret_env_values(tmp_path):
+def test_trace_and_report_redact_secret_env_values(tmp_path, python_shell_command):
     secret = "sk-test-secret-123"
-    with patch.dict(os.environ, {"OPENAI_API_KEY": secret}, clear=True):
+    command = python_shell_command(f"print({secret!r})")
+    tool_call = json.dumps(
+        {
+            "name": "run_shell",
+            "args": {"command": command, "timeout": 20},
+        }
+    )
+    with patch.dict(os.environ, {"OPENAI_API_KEY": secret}, clear=False):
         agent = build_agent(
             tmp_path,
             [
-                '<tool>{"name":"run_shell","args":{"command":"printf \'%s\' \'sk-test-secret-123\'","timeout":20}}</tool>',
+                f"<tool>{tool_call}</tool>",
                 "<final>Masked.</final>",
             ],
         )

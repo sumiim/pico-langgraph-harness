@@ -47,6 +47,8 @@ docs/*
 !docs/review-pack/README.md
 !docs/architecture/
 !docs/architecture/agent-harness-v1-overview.md
+!docs/recreation-2/
+!docs/recreation-2/*.md
 
 # Local planning, notes, and tool settings
 /.claude/

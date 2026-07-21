@@ -13,6 +13,7 @@ class AgentLoop:
 
     def run(self, user_message):
         agent = self.agent
+        agent.child_task_states = []
         run_started_at = time.monotonic()
         agent.memory.set_task_summary(user_message)
         agent.record({"role": "user", "content": user_message, "created_at": now()})
@@ -57,7 +58,7 @@ class AgentLoop:
                     "duration_ms": int((time.monotonic() - prompt_started_at) * 1000),
                 },
             )
-            if prompt_metadata.get("resume_status") == CHECKPOINT_PARTIAL_STALE_STATUS:
+            if agent.allow_checkpoint and prompt_metadata.get("resume_status") == CHECKPOINT_PARTIAL_STALE_STATUS:
                 checkpoint = agent.create_checkpoint(task_state, user_message, trigger="freshness_mismatch")
                 agent.run_store.write_task_state(task_state)
                 agent.emit_trace(
@@ -68,7 +69,7 @@ class AgentLoop:
                         "trigger": "freshness_mismatch",
                     },
                 )
-            elif prompt_metadata.get("resume_status") == CHECKPOINT_WORKSPACE_MISMATCH_STATUS:
+            elif agent.allow_checkpoint and prompt_metadata.get("resume_status") == CHECKPOINT_WORKSPACE_MISMATCH_STATUS:
                 agent.emit_trace(
                     task_state,
                     "runtime_identity_mismatch",
@@ -86,7 +87,7 @@ class AgentLoop:
                         "trigger": "workspace_mismatch",
                     },
                 )
-            if prompt_metadata.get("budget_reductions"):
+            if agent.allow_checkpoint and prompt_metadata.get("budget_reductions"):
                 checkpoint = agent.create_checkpoint(task_state, user_message, trigger="context_reduction")
                 agent.run_store.write_task_state(task_state)
                 agent.emit_trace(
@@ -147,6 +148,7 @@ class AgentLoop:
                 tool_started_at = time.monotonic()
                 agent.emit_progress(f"step {attempts}: running tool {name}")
                 tool_result = agent.execute_tool(name, args)
+                task_state.record_affected_paths(tool_result.metadata.get("affected_paths", []))
                 agent.emit_progress(
                     f"step {attempts}: tool {name} finished "
                     f"({tool_result.metadata.get('tool_status', 'unknown')})"
@@ -173,19 +175,21 @@ class AgentLoop:
                         **dict(tool_result.metadata or {}),
                     },
                 )
-                checkpoint = agent.create_checkpoint(task_state, user_message, trigger="tool_executed")
-                agent.run_store.write_task_state(task_state)
-                agent.emit_trace(
-                    task_state,
-                    "checkpoint_created",
-                    {
-                        "checkpoint_id": checkpoint["checkpoint_id"],
-                        "trigger": "tool_executed",
-                    },
-                )
+                if agent.allow_checkpoint:
+                    checkpoint = agent.create_checkpoint(task_state, user_message, trigger="tool_executed")
+                    agent.run_store.write_task_state(task_state)
+                    agent.emit_trace(
+                        task_state,
+                        "checkpoint_created",
+                        {
+                            "checkpoint_id": checkpoint["checkpoint_id"],
+                            "trigger": "tool_executed",
+                        },
+                    )
                 continue
 
             if kind == "retry":
+                task_state.record_malformed_output_recovered()
                 agent.record({"role": "assistant", "content": payload, "created_at": now()})
                 agent.run_store.write_task_state(task_state)
                 continue
@@ -193,17 +197,21 @@ class AgentLoop:
             final = (payload or raw).strip()
             agent.record({"role": "assistant", "content": final, "created_at": now()})
             task_state.finish_success(final)
-            agent.promote_durable_memory(user_message, final)
-            checkpoint = agent.create_checkpoint(task_state, user_message, trigger="run_finished")
+            if agent.allow_durable_memory_write:
+                agent.promote_durable_memory(user_message, final)
+            checkpoint = None
+            if agent.allow_checkpoint:
+                checkpoint = agent.create_checkpoint(task_state, user_message, trigger="run_finished")
             agent.run_store.write_task_state(task_state)
-            agent.emit_trace(
-                task_state,
-                "checkpoint_created",
-                {
-                    "checkpoint_id": checkpoint["checkpoint_id"],
-                    "trigger": "run_finished",
-                },
-            )
+            if checkpoint is not None:
+                agent.emit_trace(
+                    task_state,
+                    "checkpoint_created",
+                    {
+                        "checkpoint_id": checkpoint["checkpoint_id"],
+                        "trigger": "run_finished",
+                    },
+                )
             agent.emit_trace(
                 task_state,
                 "run_finished",
@@ -225,17 +233,19 @@ class AgentLoop:
             final = "Stopped after reaching the step limit without a final answer."
             task_state.stop_step_limit(final)
         agent.record({"role": "assistant", "content": final, "created_at": now()})
-        agent.promote_durable_memory(user_message, final)
+        if agent.allow_durable_memory_write:
+            agent.promote_durable_memory(user_message, final)
         agent.run_store.write_task_state(task_state)
-        checkpoint = agent.create_checkpoint(task_state, user_message, trigger=task_state.stop_reason or "run_stopped")
-        agent.emit_trace(
-            task_state,
-            "checkpoint_created",
-            {
-                "checkpoint_id": checkpoint["checkpoint_id"],
-                "trigger": task_state.stop_reason or "run_stopped",
-            },
-        )
+        if agent.allow_checkpoint:
+            checkpoint = agent.create_checkpoint(task_state, user_message, trigger=task_state.stop_reason or "run_stopped")
+            agent.emit_trace(
+                task_state,
+                "checkpoint_created",
+                {
+                    "checkpoint_id": checkpoint["checkpoint_id"],
+                    "trigger": task_state.stop_reason or "run_stopped",
+                },
+            )
         agent.emit_trace(
             task_state,
             "run_finished",

@@ -4,7 +4,7 @@
 这个对象会被不断写入 task_state.json，供运行中观察和运行后复盘。
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import uuid4
 
@@ -22,6 +22,10 @@ STOP_REASON_APPROVAL_DENIED = "approval_denied"
 STOP_REASON_DELEGATE_FAILED = "delegate_failed"
 STOP_REASON_PERSISTENCE_ERROR = "persistence_error"
 STOP_REASON_RESUME_LOAD_ERROR = "resume_load_error"
+STOP_REASON_REVIEW_RETRY_LIMIT_REACHED = "review_retry_limit_reached"
+STOP_REASON_NO_CHANGES_TO_REVIEW = "no_changes_to_review"
+STOP_REASON_BUDGET_EXHAUSTED = "budget_exhausted"
+STOP_REASON_RUNTIME_ERROR = "runtime_error"
 
 
 @dataclass
@@ -37,6 +41,9 @@ class TaskState:
     final_answer: str = ""
     checkpoint_id: str = ""
     resume_status: str = ""
+    sandbox_violations: int = 0
+    malformed_output_recovered: int = 0
+    affected_paths: list[str] = field(default_factory=list)
 
     @classmethod
     def create(cls, task_id, user_request, run_id=""):
@@ -58,6 +65,9 @@ class TaskState:
             final_answer=str(data.get("final_answer", "")),
             checkpoint_id=str(data.get("checkpoint_id", "")),
             resume_status=str(data.get("resume_status", "")),
+            sandbox_violations=int(data.get("sandbox_violations", 0)),
+            malformed_output_recovered=int(data.get("malformed_output_recovered", 0)),
+            affected_paths=[str(path) for path in data.get("affected_paths", [])],
         )
 
     def record_attempt(self):
@@ -69,6 +79,19 @@ class TaskState:
         # tool_steps 只统计真正进入执行阶段的工具调用次数。
         self.tool_steps += 1
         self.last_tool = str(name or "")
+        return self
+
+    def record_sandbox_violation(self):
+        self.sandbox_violations += 1
+        return self
+
+    def record_malformed_output_recovered(self):
+        self.malformed_output_recovered += 1
+        return self
+
+    def record_affected_paths(self, paths):
+        normalized = {str(path).strip() for path in (paths or []) if str(path).strip()}
+        self.affected_paths = sorted(set(self.affected_paths) | normalized)
         return self
 
     def stop(self, stop_reason, status=STATUS_STOPPED, final_answer=""):
@@ -107,4 +130,7 @@ class TaskState:
             "final_answer": self.final_answer,
             "checkpoint_id": self.checkpoint_id,
             "resume_status": self.resume_status,
+            "sandbox_violations": self.sandbox_violations,
+            "malformed_output_recovered": self.malformed_output_recovered,
+            "affected_paths": list(self.affected_paths),
         }
