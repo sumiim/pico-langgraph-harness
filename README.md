@@ -44,9 +44,14 @@ flowchart TD
     Native --> Audit["TaskState / EventSink / trace / report"]
     Router --> Audit
     Research --> Audit
+    Conversation --> Audit
+    ReadOnly --> Audit
     Execute --> Audit
     Review --> Audit
+    Finalize --> Audit
 ```
+
+这里的“审计”和 Patch Review 是两件事：所有已经启动的 native / LangGraph 运行都会写入 TaskState，并通过 EventSink 记录事件，最终生成 trace 和 report；只有解析为 `code_change` 的任务必须进入 Review delegate 做修改验收。`conversation` 会记录路由、模型协议、回答和终态事件，`read_only` 还会记录只读工具、可选 Research delegate 与权限边界事件，但二者都不执行 Patch Review。
 
 ### 意图与能力边界
 
@@ -125,6 +130,53 @@ CLI 显式参数 > 项目 .env 中的 PICO_* 变量 > 兼容环境变量 > 代�
 ```
 
 ## 使用方式
+
+查看当前安装版本支持的完整参数：
+
+```cmd
+python -m pico run --help
+python -m pico eval --help
+```
+
+### `run` 参数速查
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `[prompt ...]` | 无 | 可选的一次性任务；省略后进入交互式 REPL |
+| `--cwd PATH` | `.` | 工作区目录 |
+| `--backend {native,langgraph}` | `native` | 执行后端 |
+| `--provider {ollama,openai,anthropic,deepseek}` | `deepseek` | 模型服务类型 |
+| `--model MODEL` | provider 配置值 | 覆盖主执行模型名称 |
+| `--host URL` | Ollama 默认地址 | Ollama 服务地址 |
+| `--base-url URL` | provider 配置值 | OpenAI、Anthropic 或 DeepSeek 兼容接口地址 |
+| `--ollama-timeout SECONDS` | `300` | Ollama 请求超时 |
+| `--openai-timeout SECONDS` | `300` | OpenAI、Anthropic 或 DeepSeek 请求超时 |
+| `--resume SESSION` | 无 | 恢复指定 session，或使用 `latest` |
+| `--approval {ask,auto,never}` | `ask` | 风险工具审批策略 |
+| `--secret-env-name NAME` | 无 | 增加需要从 trace/report 脱敏的环境变量名；可重复 |
+| `--max-steps N` | `6` | native 工具调用或 LangGraph Coordinator 工具步骤上限 |
+| `--max-new-tokens N` | `512` | 单次模型输出 token 上限 |
+| `--temperature FLOAT` | `0.2` | 主模型采样温度；Router 固定使用 `0.0` |
+| `--top-p FLOAT` | `0.9` | Ollama top-p 参数 |
+| `--quiet` | 关闭 | 隐藏逐步进度信息 |
+
+仅 `--backend langgraph` 使用以下参数：
+
+| 参数 | 默认值 | 说明与约束 |
+| --- | --- | --- |
+| `--task-mode {auto,conversation,read_only,code_change}` | `auto` | 自动识别或显式指定任务意图 |
+| `--router-model MODEL` | 主模型 | 只用于 `--task-mode auto` 的无工具意图分类 |
+| `--acceptance TEXT` | 任务 prompt | 当最终意图为 `code_change` 时传给 Review delegate 的验收标准 |
+| `--focus-path PATH` | 无 | Review 关注的工作区相对路径；可重复；仅用于 `auto/code_change`，在 `auto` 下会强制走 `code_change` |
+| `--research` / `--no-research` | 自动决定 | 显式启用或关闭 Research delegate；`conversation` 不允许启用 Research |
+
+`eval` 入口保持精简：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--tasks PATH` | `benchmarks/coding_tasks.json` | benchmark 输入文件 |
+| `--out PATH` | `benchmarks/results/<timestamp>-eval.json` | evaluation artifact 输出路径 |
+| `--backend {native,langgraph}` | `native` | 被评测的执行后端 |
 
 ### 原生 Pico
 
