@@ -2087,7 +2087,7 @@
       "expected_artifact": "README.md fixture stays available while durable rejection is recorded",
       "expected_artifact_exists": true,
       "failure_category": null,
-      "final_answer": "Project convention: Keep verifier outcomes stable across reruns.\nDependency: API key is sk-benchmark-secret.\nDecision: Current goal is debug the harness.",
+      "final_answer": "Project convention: Keep verifier outcomes stable across reruns.\nDependency: API key is <redacted>.\nDecision: Current goal is debug the harness.",
       "fixture_copy_relpath": "durable_promotion_reject/bench_repo_readme",
       "fixture_repo": "tests/fixtures/bench_repo_readme",
       "id": "durable_promotion_reject",
@@ -2109,7 +2109,7 @@
           "key-decisions:transient_task_state"
         ],
         "durable_superseded": [],
-        "final_answer": "Project convention: Keep verifier outcomes stable across reruns.\nDependency: API key is sk-benchmark-secret.\nDecision: Current goal is debug the harness.",
+        "final_answer": "Project convention: Keep verifier outcomes stable across reruns.\nDependency: API key is <redacted>.\nDecision: Current goal is debug the harness.",
         "prompt_metadata": {
           "budget_reductions": [],
           "current_request": {
@@ -2222,7 +2222,7 @@
         "task_state": {
           "attempts": 1,
           "checkpoint_id": "ckpt_ab3866e9",
-          "final_answer": "Project convention: Keep verifier outcomes stable across reruns.\nDependency: API key is sk-benchmark-secret.\nDecision: Current goal is debug the harness.",
+          "final_answer": "Project convention: Keep verifier outcomes stable across reruns.\nDependency: API key is <redacted>.\nDecision: Current goal is debug the harness.",
           "last_tool": "",
           "resume_status": "no-checkpoint",
           "run_id": "run_20260607-170459-3c60a6",
@@ -2243,7 +2243,7 @@
       "task_state": {
         "attempts": 1,
         "checkpoint_id": "ckpt_ab3866e9",
-        "final_answer": "Project convention: Keep verifier outcomes stable across reruns.\nDependency: API key is sk-benchmark-secret.\nDecision: Current goal is debug the harness.",
+        "final_answer": "Project convention: Keep verifier outcomes stable across reruns.\nDependency: API key is <redacted>.\nDecision: Current goal is debug the harness.",
         "last_tool": "",
         "resume_status": "no-checkpoint",
         "run_id": "run_20260607-170459-3c60a6",
