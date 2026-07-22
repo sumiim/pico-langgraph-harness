@@ -29,7 +29,25 @@ from .tool_executor import ToolExecutor
 from . import tools as toolkit
 from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
 
-DEFAULT_SHELL_ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "PWD", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "USER")
+DEFAULT_SHELL_ENV_ALLOWLIST = (
+    "COMSPEC",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "PATH",
+    "PATHEXT",
+    "PWD",
+    "SHELL",
+    "SYSTEMROOT",
+    "TEMP",
+    "TERM",
+    "TMP",
+    "TMPDIR",
+    "USER",
+    "WINDIR",
+)
 DEFAULT_FEATURE_FLAGS = {
     "memory": True,
     "relevant_memory": True,

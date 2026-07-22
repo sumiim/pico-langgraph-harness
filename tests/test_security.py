@@ -1,3 +1,4 @@
+from pico.runtime import DEFAULT_SHELL_ENV_ALLOWLIST
 from pico.security import (
     REDACTED_VALUE,
     detected_secret_env_items,
@@ -48,3 +49,9 @@ def test_shell_env_uses_allowlist_and_sets_pwd_with_path_fallback(tmp_path):
     filtered = shell_env(env=env, allowlist=("HOME",), root=tmp_path)
 
     assert filtered == {"HOME": "/home/user", "PWD": str(tmp_path), "PATH": "/usr/bin"}
+
+
+def test_default_shell_env_allowlist_includes_windows_runtime_requirements():
+    required = {"COMSPEC", "PATHEXT", "SYSTEMROOT", "WINDIR"}
+
+    assert required <= set(DEFAULT_SHELL_ENV_ALLOWLIST)
