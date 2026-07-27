@@ -57,6 +57,183 @@ TASK_FIXTURE_ARTIFACTS = {
     "bench_repo_patch": "sample.txt",
 }
 
+PAIRED_REVIEW_DEFECT_CASES = {
+    "paired_review_recovery": ("sample.txt", "beta", "beta-reviewed", "gamma", "gamma-reviewed"),
+    "paired_text_ownership_recovery": (
+        "sample.txt",
+        "status=pending",
+        "status=ready",
+        "owner=unassigned",
+        "owner=platform-team",
+    ),
+    "paired_readme_deployment_recovery": (
+        "README.md",
+        "Environment: local",
+        "Environment: staging",
+        "Deployment: manual",
+        "Deployment: automated",
+    ),
+    "paired_readme_audit_recovery": (
+        "README.md",
+        "Logging: basic",
+        "Logging: structured",
+        "Audit: disabled",
+        "Audit: enabled",
+    ),
+    "paired_json_retry_recovery": (
+        "settings.json",
+        '"timeout": 10',
+        '"timeout": 30',
+        '"retries": 1',
+        '"retries": 3',
+    ),
+    "paired_json_audit_recovery": (
+        "settings.json",
+        '"log_level": "info"',
+        '"log_level": "debug"',
+        '"audit": false',
+        '"audit": true',
+    ),
+    "paired_toml_mode_recovery": (
+        "settings.toml",
+        "enabled = false",
+        "enabled = true",
+        'mode = "legacy"',
+        'mode = "strict"',
+    ),
+    "paired_toml_region_recovery": (
+        "settings.toml",
+        "workers = 1",
+        "workers = 4",
+        'region = "local"',
+        'region = "global"',
+    ),
+    "paired_python_retry_recovery": (
+        "service.py",
+        "DEFAULT_TIMEOUT = 10",
+        "DEFAULT_TIMEOUT = 30",
+        "MAX_RETRIES = 1",
+        "MAX_RETRIES = 3",
+    ),
+    "paired_python_logging_recovery": (
+        "service.py",
+        "FEATURE_ENABLED = False",
+        "FEATURE_ENABLED = True",
+        'LOG_LEVEL = "info"',
+        'LOG_LEVEL = "debug"',
+    ),
+}
+
+PAIRED_CONTROL_CASES = {
+    "paired_text_region_control": (
+        "sample.txt",
+        "region=local",
+        "region=global",
+        "mode=legacy",
+        "mode=strict",
+    ),
+    "paired_text_marker_control": (
+        "sample.txt",
+        "alpha",
+        "alpha-stable",
+        "placeholder",
+        "complete",
+    ),
+    "paired_readme_queue_control": (
+        "README.md",
+        "Cache: cold",
+        "Cache: warm",
+        "Queue: sync",
+        "Queue: async",
+    ),
+    "paired_readme_runtime_control": (
+        "README.md",
+        "Environment: local",
+        "Environment: production",
+        "Logging: basic",
+        "Logging: structured",
+    ),
+    "paired_json_batch_control": (
+        "settings.json",
+        '"cache_ttl": 30',
+        '"cache_ttl": 120',
+        '"batch_size": 10',
+        '"batch_size": 50',
+    ),
+    "paired_json_logging_control": (
+        "settings.json",
+        '"timeout": 10',
+        '"timeout": 20',
+        '"log_level": "info"',
+        '"log_level": "warning"',
+    ),
+    "paired_toml_format_control": (
+        "settings.toml",
+        "compression = false",
+        "compression = true",
+        'format = "text"',
+        'format = "json"',
+    ),
+    "paired_toml_workers_control": (
+        "settings.toml",
+        "workers = 1",
+        "workers = 8",
+        "enabled = false",
+        "enabled = true",
+    ),
+    "paired_python_batch_control": (
+        "service.py",
+        "CACHE_TTL = 30",
+        "CACHE_TTL = 120",
+        "BATCH_SIZE = 10",
+        "BATCH_SIZE = 50",
+    ),
+    "paired_python_runtime_control": (
+        "service.py",
+        "FEATURE_ENABLED = False",
+        "FEATURE_ENABLED = True",
+        'LOG_LEVEL = "info"',
+        'LOG_LEVEL = "warning"',
+    ),
+}
+
+
+def _paired_patch_output(path, old_text, new_text):
+    return (
+        f'<tool name="patch_file" path="{path}"><old_text>{old_text}</old_text>'
+        f"<new_text>{new_text}</new_text></tool>"
+    )
+
+
+def _paired_read_output(path):
+    return f'<tool>{{"name":"read_file","args":{{"path":"{path}","start":1,"end":40}}}}</tool>'
+
+
+def _paired_native_outputs(case, *, complete):
+    path, first_old, first_new, second_old, second_new = case
+    outputs = [_paired_patch_output(path, first_old, first_new)]
+    if complete:
+        outputs.append(_paired_patch_output(path, second_old, second_new))
+    outputs.append("<final>Applied the requested updates.</final>")
+    return outputs
+
+
+def _paired_langgraph_outputs(case, *, complete):
+    path, _, _, second_old, second_new = case
+    outputs = _paired_native_outputs(case, complete=complete)
+    outputs.append(_paired_read_output(path))
+    if not complete:
+        outputs.extend(
+            [
+                f"<final>status: needs_fix\nissue: {second_old} was not updated\nverify_targets: {path}</final>",
+                _paired_patch_output(path, second_old, second_new),
+                "<final>Completed the missing update.</final>",
+                _paired_read_output(path),
+            ]
+        )
+    outputs.append(f"<final>status: pass\nissues: none\nverify_targets: {path}</final>")
+    return outputs
+
 NATIVE_SCRIPTED_MODEL_OUTPUTS = {
     "readme_intro_locked": [
         '<tool name="patch_file" path="README.md"><old_text>This is a placeholder benchmark fixture.</old_text><new_text>This fixture is a locked benchmark workspace.</new_text></tool>',
@@ -151,6 +328,14 @@ LANGGRAPH_SCRIPTED_MODEL_OUTPUTS = {
         "<final>status: pass\nissues: none\nverify_targets: sample.txt</final>",
     ],
 }
+
+for task_id, case in PAIRED_REVIEW_DEFECT_CASES.items():
+    NATIVE_SCRIPTED_MODEL_OUTPUTS[task_id] = _paired_native_outputs(case, complete=False)
+    LANGGRAPH_SCRIPTED_MODEL_OUTPUTS[task_id] = _paired_langgraph_outputs(case, complete=False)
+
+for task_id, case in PAIRED_CONTROL_CASES.items():
+    NATIVE_SCRIPTED_MODEL_OUTPUTS[task_id] = _paired_native_outputs(case, complete=True)
+    LANGGRAPH_SCRIPTED_MODEL_OUTPUTS[task_id] = _paired_langgraph_outputs(case, complete=True)
 
 SCRIPTED_MODEL_OUTPUTS = {
     "native": NATIVE_SCRIPTED_MODEL_OUTPUTS,
@@ -389,6 +574,25 @@ def validate_benchmark(data, repo_root=None):
         if not isinstance(requires_research, bool):
             raise ValueError(f"benchmark task {task_id} requires_research must be a boolean")
 
+        review_expectation = task.get("review_expectation", "")
+        if not isinstance(review_expectation, str) or review_expectation not in {
+            "",
+            "needs_fix",
+            "pass",
+        }:
+            raise ValueError(
+                f"benchmark task {task_id} review_expectation must be needs_fix or pass"
+            )
+        defect_type = task.get("defect_type", "")
+        if review_expectation and (not isinstance(defect_type, str) or not defect_type.strip()):
+            raise ValueError(
+                f"benchmark task {task_id} defect_type must be a non-empty string"
+            )
+        if not review_expectation and defect_type:
+            raise ValueError(
+                f"benchmark task {task_id} defect_type requires review_expectation"
+            )
+
         backends = task.get("backends", ["native"])
         if not isinstance(backends, list) or not backends:
             raise ValueError(f"benchmark task {task_id} backends must be a non-empty list")
@@ -426,6 +630,8 @@ def validate_benchmark(data, repo_root=None):
             raise ValueError(f"benchmark task {task_id} acceptance must be a non-empty string")
         normalized_task["acceptance"] = acceptance.strip()
         normalized_task["requires_research"] = requires_research
+        normalized_task["review_expectation"] = review_expectation
+        normalized_task["defect_type"] = defect_type.strip() if isinstance(defect_type, str) else ""
         normalized_task["focus_paths"] = normalized_focus_paths
         normalized_task["backends"] = normalized_backends
         if "setup" in task:
@@ -492,6 +698,57 @@ def summarize_rows(rows):
         "within_budget_rate": (within_budget / eligible_tasks) if eligible_tasks else 0.0,
         "verifier_pass_rate": (verifier_passes / eligible_tasks) if eligible_tasks else 0.0,
         "failure_category_counts": failure_category_counts,
+    }
+
+
+def summarize_review_rows(rows):
+    review_rows = [
+        row
+        for row in rows
+        if row.get("status") != "skipped" and row.get("review_expectation") in {"needs_fix", "pass"}
+    ]
+    if not review_rows:
+        return None
+
+    defect_rows = [row for row in review_rows if row["review_expectation"] == "needs_fix"]
+    control_rows = [row for row in review_rows if row["review_expectation"] == "pass"]
+    detected = sum(int(row.get("review_retries", 0)) > 0 for row in defect_rows)
+    recovered = sum(bool(row.get("passed")) for row in defect_rows)
+    controls_retained = sum(bool(row.get("passed")) for row in control_rows)
+    false_rejections = sum(int(row.get("review_retries", 0)) > 0 for row in control_rows)
+    false_negatives = len(defect_rows) - detected
+    true_negatives = len(control_rows) - false_rejections
+    precision = detected / (detected + false_rejections) if detected + false_rejections else None
+    recall = detected / len(defect_rows) if defect_rows else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision is not None and precision + recall else None
+    task_count = len(review_rows)
+    return {
+        "defect_cases": len(defect_rows),
+        "defects_detected": detected,
+        "defect_detection_rate": recall,
+        "defects_recovered": recovered,
+        "defect_recovery_rate": recovered / len(defect_rows) if defect_rows else 0.0,
+        "control_cases": len(control_rows),
+        "controls_retained": controls_retained,
+        "control_retention_rate": controls_retained / len(control_rows) if control_rows else 0.0,
+        "false_rejections": false_rejections,
+        "false_rejection_rate": false_rejections / len(control_rows) if control_rows else 0.0,
+        "review_confusion_matrix": {
+            "true_positives": detected,
+            "false_positives": false_rejections,
+            "true_negatives": true_negatives,
+            "false_negatives": false_negatives,
+        },
+        "review_precision": precision,
+        "review_recall": recall,
+        "review_f1": f1,
+        "review_specificity": true_negatives / len(control_rows) if control_rows else 0.0,
+        "average_tool_steps": sum(int(row.get("tool_steps", 0)) for row in review_rows) / task_count,
+        "average_attempts": sum(int(row.get("attempts", 0)) for row in review_rows) / task_count,
+        "average_review_calls": sum(int(row.get("review_calls", 0)) for row in review_rows)
+        / task_count,
+        "average_duration_ms": sum(int(row.get("duration_ms", 0)) for row in review_rows)
+        / task_count,
     }
 
 
@@ -680,6 +937,7 @@ class BenchmarkEvaluator:
             except Exception as exc:
                 rows.append(self._harness_failure_row(task, type(exc).__name__))
         summary = summarize_rows(rows)
+        review_summary = summarize_review_rows(rows)
         artifact = {
             "schema_version": EVALUATION_ARTIFACT_SCHEMA_VERSION,
             "captured_at": _now_in_timezone(self.timezone_name),
@@ -711,6 +969,8 @@ class BenchmarkEvaluator:
             "failure_category_counts": summary["failure_category_counts"],
             "rows": rows,
         }
+        if review_summary is not None:
+            artifact["review_summary"] = review_summary
         self._write_artifact(artifact)
         return artifact
 
@@ -827,6 +1087,8 @@ class BenchmarkEvaluator:
             "verifier_stdout": verifier.stdout,
             "verifier_stderr": verifier.stderr,
             "category": task["category"],
+            "review_expectation": str(task.get("review_expectation", "")),
+            "defect_type": str(task.get("defect_type", "")),
             "status": "pass" if passed else "fail",
             "passed": passed,
             "failure_category": failure_category,
@@ -911,6 +1173,8 @@ class BenchmarkEvaluator:
             "verifier_stdout": "",
             "verifier_stderr": "",
             "category": task["category"],
+            "review_expectation": str(task.get("review_expectation", "")),
+            "defect_type": str(task.get("defect_type", "")),
             "status": status,
             "passed": None if status == "skipped" else False,
             "failure_category": failure_category,

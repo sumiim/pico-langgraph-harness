@@ -262,6 +262,28 @@ python -m pico eval --backend native --tasks benchmarks\delegate_tasks.json --ou
 | LangGraph | 4 | 3 | 1 | 3 |
 | native | 4 | 1 | 3 | 1 |
 
+Review 专项对照实验使用独立的 paired benchmark。两个后端共享 prompt、fixture、工具权限、预算、初始模型输出和 verifier，区别仅在于 LangGraph 会执行 Review 与修复闭环：
+
+```cmd
+python -m pico eval --backend native --tasks benchmarks\paired_tasks.json --out "%TEMP%\native-paired.json"
+python -m pico eval --backend langgraph --tasks benchmarks\paired_tasks.json --out "%TEMP%\langgraph-paired.json"
+```
+
+该确定性测试集包含 20 个配对样本：10 个初始执行遗漏一项验收条件的缺陷注入样本，以及 10 个初始执行已经正确的控制样本。缺陷组用于衡量 Review 检出和修复能力，控制组用于衡量误拒行为。当前基线：
+
+| metric | native | LangGraph |
+| --- | ---: | ---: |
+| task pass rate | 10/20 (50%) | 20/20 (100%) |
+| injected defects detected | 0/10 | 10/10 |
+| injected defects recovered | 0/10 | 10/10 |
+| correct controls retained | 10/10 | 10/10 |
+| Review false rejections | N/A | 0/10 |
+| Review precision / recall / F1 | N/A / 0% / N/A | 100% / 100% / 100% |
+| average tool steps | 1.5 | 5.0 |
+| average attempts | 2.5 | 6.5 |
+
+Native 命令因 10 个缺陷注入样本未通过 verifier 而返回退出码 `1`，这是预期对照结果。artifact 的 `review_summary` 会输出 Review 混淆矩阵、precision、recall、F1、specificity、缺陷恢复率、误拒率和平均执行开销。该基线验证的是 scripted harness 下 Review 闭环的机制收益与成本，不代表通用模型能力提升。
+
 主要指标包括：
 
 - `tool_steps / attempts / within_budget`
