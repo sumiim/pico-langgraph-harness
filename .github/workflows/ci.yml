@@ -40,10 +40,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: |
-            pyproject.toml
-            examples/langgraph-pico/pyproject.toml
+            server/pyproject.toml
+            server/examples/langgraph-pico/pyproject.toml
 
       - name: Install project
+        working-directory: server
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e .
@@ -51,9 +52,11 @@ jobs:
           python -m pip install pytest
 
       - name: Check dependencies
+        working-directory: server
         run: python -m pip check
 
       - name: Run tests
+        working-directory: server
         run: python -m pytest -q
 
   build:
@@ -72,16 +75,18 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: |
-            pyproject.toml
-            examples/langgraph-pico/pyproject.toml
+            server/pyproject.toml
+            server/examples/langgraph-pico/pyproject.toml
 
       - name: Install build tooling
         run: python -m pip install --upgrade pip build
 
       - name: Build native package
+        working-directory: server
         run: python -m build --wheel .
 
       - name: Build LangGraph package
+        working-directory: server
         run: python -m build --wheel examples/langgraph-pico
 
       - name: Upload wheels
@@ -89,5 +94,5 @@ jobs:
         with:
           name: pico-wheels
           path: |
-            dist/*.whl
-            examples/langgraph-pico/dist/*.whl
+            server/dist/*.whl
+            server/examples/langgraph-pico/dist/*.whl
