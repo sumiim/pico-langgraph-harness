@@ -42,14 +42,13 @@ readme_intro_locked/
 !.env.example
 
 # Local docs not intended for publication
-server/docs/*
-!server/docs/requirements-v1.md
-!server/docs/review-pack/
-!server/docs/review-pack/README.md
-!server/docs/architecture/
-!server/docs/architecture/agent-harness-v1-overview.md
-!server/docs/recreation-2/
-!server/docs/recreation-2/*.md
+docs/*
+!docs/review-pack/
+!docs/review-pack/README.md
+!docs/architecture/
+!docs/architecture/agent-harness-v1-overview.md
+!docs/recreation-2/
+!docs/recreation-2/*.md
 
 # Local planning, notes, and tool settings
 /.claude/
